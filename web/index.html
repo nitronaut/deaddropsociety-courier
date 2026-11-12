@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dead Drop Society - Web Version</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            background: #0f0f14;
+            color: #f0f0fa;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+            user-select: none;
+        }
+        
+        #game-container {
+            display: flex;
+            height: 100vh;
+            width: 100vw;
+        }
+        
+        #game-canvas {
+            background: #0f0f14;
+            display: block;
+        }
+        
+        #ui-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 230px;
+            height: 40px;
+            background: rgba(20, 20, 30, 0.9);
+            border: 1px solid #f0f0fa;
+            display: flex;
+            align-items: center;
+            padding: 0 15px;
+            gap: 20px;
+            font-size: 14px;
+            pointer-events: none;
+        }
+        
+        #minimap-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 200px;
+            height: 200px;
+            background: rgba(20, 20, 30, 0.9);
+            border: 1px solid #f0f0fa;
+        }
+        
+        #minimap-canvas {
+            width: 100%;
+            height: 100%;
+        }
+        
+        #alert-container {
+            position: absolute;
+            top: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            pointer-events: none;
+        }
+        
+        .alert-message {
+            background: rgba(255, 200, 100, 0.8);
+            color: #0f0f14;
+            padding: 5px 15px;
+            border-radius: 3px;
+            font-size: 14px;
+            font-weight: bold;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        
+        .alert-message.show {
+            opacity: 1;
+        }
+        
+        #menu-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        
+        #menu-content {
+            text-align: center;
+            max-width: 600px;
+            padding: 40px;
+        }
+        
+        #menu-title {
+            font-size: 48px;
+            color: #00c8ff;
+            margin-bottom: 20px;
+            text-shadow: 0 0 20px #00c8ff;
+        }
+        
+        #menu-subtitle {
+            font-size: 18px;
+            color: #c0c0d0;
+            margin-bottom: 40px;
+        }
+        
+        #menu-instructions {
+            font-size: 14px;
+            color: #f0f0fa;
+            line-height: 1.6;
+            margin-bottom: 30px;
+        }
+        
+        #menu-controls {
+            font-size: 14px;
+            color: #c0c0d0;
+            text-align: left;
+            margin: 20px 0;
+        }
+        
+        #menu-controls kbd {
+            background: rgba(0, 200, 255, 0.3);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+            border: 1px solid #00c8ff;
+        }
+        
+        #start-button {
+            background: linear-gradient(135deg, #00c8ff, #0088cc);
+            color: #0f0f14;
+            border: none;
+            padding: 15px 40px;
+            font-size: 20px;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 5px;
+            transition: all 0.3s;
+            font-family: 'Courier New', monospace;
+        }
+        
+        #start-button:hover {
+            background: linear-gradient(135deg, #00e8ff, #00a8dd);
+            transform: scale(1.05);
+            box-shadow: 0 0 20px #00c8ff;
+        }
+        
+        #game-over-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        
+        #victory-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        
+        #game-over-title, #victory-title {
+            font-size: 64px;
+            margin-bottom: 30px;
+            text-shadow: 0 0 30px currentColor;
+        }
+        
+        #game-over-title {
+            color: #ff5050;
+        }
+        
+        #victory-title {
+            color: #00ff96;
+        }
+        
+        #stats-container {
+            background: rgba(20, 20, 30, 0.9);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        #stats-container div {
+            margin: 10px 0;
+            font-size: 18px;
+        }
+        
+        .restart-button {
+            background: linear-gradient(135deg, #00c8ff, #0088cc);
+            color: #0f0f14;
+            border: none;
+            padding: 15px 40px;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 5px;
+            transition: all 0.3s;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .restart-button:hover {
+            background: linear-gradient(135deg, #00e8ff, #00a8dd);
+            transform: scale(1.05);
+            box-shadow: 0 0 20px #00c8ff;
+        }
+        
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            color: #00c8ff;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .pulse {
+            animation: pulse 1s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="game-canvas"></canvas>
+        <div id="ui-panel">
+            <span id="time-display">Time: 00:00</span>
+            <span id="score-display">Score: 0</span>
+            <span id="scan-display">Scan: READY</span>
+            <span id="alert-display">Alert: 0%</span>
+            <span id="stealth-display">NORMAL</span>
+        </div>
+        <div id="minimap-container">
+            <canvas id="minimap-canvas"></canvas>
+        </div>
+        <div id="alert-container"></div>
+        
+        <div id="menu-overlay">
+            <div id="menu-content">
+                <div id="menu-title">DEAD DROP SOCIETY</div>
+                <div id="menu-subtitle">A Near-Future Courier Game</div>
+                <div id="menu-instructions">
+                    You are a DDS courier in a near-future city.<br>
+                    Locate physical dead drops holding encrypted data caches.<br>
+                    Find the freshest cache, extract it, and upload it at a terminal<br>
+                    to update all remaining dead drops before data decays!
+                </div>
+                <div id="menu-controls">
+                    <div><kbd>WASD</kbd> / <kbd>Arrow Keys</kbd> - Move</div>
+                    <div><kbd>Shift</kbd> - Stealth Mode (slower, less detectable)</div>
+                    <div><kbd>Space</kbd> - Scan for dead drops</div>
+                    <div><kbd>E</kbd> - Extract cache from dead drop</div>
+                    <div><kbd>Q</kbd> - Upload cache at terminal</div>
+                    <div><kbd>Tab</kbd> - Toggle minimap</div>
+                    <div><kbd>M</kbd> - Toggle HUD</div>
+                    <div><kbd>Esc</kbd> - Menu / Quit</div>
+                </div>
+                <button id="start-button">PRESS ENTER TO START</button>
+            </div>
+        </div>
+        
+        <div id="game-over-overlay">
+            <div id="game-over-title">GAME OVER</div>
+            <div id="stats-container">
+                <div>Final Score: <span id="final-score">0</span></div>
+                <div>Time Survived: <span id="final-time">00:00</span></div>
+                <div>Dead Drops Discovered: <span id="final-discovered">0</span>/<span id="total-drops">20</span></div>
+                <div>Caches Extracted: <span id="final-extracted">0</span></div>
+                <div>Dead Drops Updated: <span id="final-updated">0</span></div>
+                <div>Caches Decayed: <span id="final-decayed">0</span></div>
+            </div>
+            <button class="restart-button">PRESS ENTER TO RESTART</button>
+        </div>
+        
+        <div id="victory-overlay">
+            <div id="victory-title">VICTORY</div>
+            <div style="font-size: 24px; margin-bottom: 20px;">All dead drops updated successfully!</div>
+            <div id="stats-container">
+                <div>Final Score: <span id="victory-score">0</span></div>
+                <div>Time: <span id="victory-time">00:00</span></div>
+                <div>All <span id="victory-drops">20</span> dead drops updated!</div>
+            </div>
+            <button class="restart-button">PRESS ENTER TO PLAY AGAIN</button>
+        </div>
+    </div>
+
+    <script src="dead_drop_society.js"></script>
+</body>
+</html>
