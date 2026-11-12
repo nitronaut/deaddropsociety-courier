@@ -216,6 +216,8 @@ class Player {
     }
     
     update(dt, keys) {
+        if (!keys) keys = {};
+        
         let direction = new Vector2(0, 0);
         if (keys.w || keys.ArrowUp) direction.y -= 1;
         if (keys.s || keys.ArrowDown) direction.y += 1;
@@ -232,9 +234,11 @@ class Player {
             this.velocity = new Vector2(0, 0);
         }
         
-        this.position = this.position.add(this.velocity.mul(dt));
+        if (this.velocity && dt) {
+            this.position = this.position.add(this.velocity.mul(dt));
+        }
         
-        this.stealth_mode = keys.shiftLeft || keys.shiftRight;
+        this.stealth_mode = (keys.shiftLeft || keys.shiftRight) === true;
         
         if (this.scan_cooldown > 0) {
             this.scan_cooldown -= dt;
@@ -567,6 +571,12 @@ class WorldGenerator {
 
 // ==================== UTILITY FUNCTIONS ====================
 
+function safeGetElement(id) {
+    const el = document.getElementById(id);
+    if (!el) console.warn(`Element with id "${id}" not found`);
+    return el;
+}
+
 function darkenColor(hex, amount) {
     const r = Math.max(0, parseInt(hex.slice(1, 3), 16) - amount);
     const g = Math.max(0, parseInt(hex.slice(3, 5), 16) - amount);
@@ -578,9 +588,14 @@ function darkenColor(hex, amount) {
 
 class DeadDropSociety {
     constructor() {
-        this.canvas = document.getElementById('game-canvas');
-        this.ctx = this.canvas.getContext('2d');
-        this.minimapCanvas = document.getElementById('minimap-canvas');
+        try {
+            this.canvas = document.getElementById('game-canvas');
+            this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
+            if (!this.canvas || !this.ctx) {
+                console.error('Cannot initialize game: canvas not found');
+                return;
+            }
+            this.minimapCanvas = document.getElementById('minimap-canvas');
         this.minimapCtx = this.minimapCanvas.getContext('2d');
         
         this.canvas.width = SCREEN_WIDTH;
@@ -642,10 +657,19 @@ class DeadDropSociety {
         // Start game loop
         this.lastTime = performance.now();
         this.gameLoop();
+        } catch (e) {
+            console.error('Error in DeadDropSociety constructor:', e);
+            if (this.ctx) {
+                this.ctx.fillStyle = 'red';
+                this.ctx.font = '20px Arial';
+                this.ctx.fillText('Error: ' + e.message, 50, 50);
+            }
+        }
     }
     
     setupEventListeners() {
-        document.addEventListener('keydown', (e) => {
+        try {
+            document.addEventListener('keydown', (e) => {
             this.keys[e.code] = true;
             
             if (e.code === 'Escape') {
@@ -656,7 +680,7 @@ class DeadDropSociety {
                 }
             }
             
-            if (e.code === 'Space' && this.state === GameState.PLAYING && this.player.scan_cooldown <= 0) {
+            if (e.code === 'Space' && this.state === GameState.PLAYING && this.player && this.player.scan_cooldown <= 0) {
                 this.startScan();
             }
             
@@ -691,6 +715,9 @@ class DeadDropSociety {
         document.addEventListener('keyup', (e) => {
             this.keys[e.code] = false;
         });
+        } catch (e) {
+            console.error('Error in setupEventListeners:', e);
+        }
         
         this.canvas.addEventListener('click', (e) => {
             if (this.showMinimap) {
@@ -969,7 +996,10 @@ class DeadDropSociety {
     // ==================== RENDERING METHODS ====================
 
     drawMap() {
-        const startX = Math.floor(this.cameraOffset.x / TILE_SIZE) * TILE_SIZE;
+        try {
+            if (!this.ctx || !this.cameraOffset) return;
+            
+            const startX = Math.floor(this.cameraOffset.x / TILE_SIZE) * TILE_SIZE;
         const startY = Math.floor(this.cameraOffset.y / TILE_SIZE) * TILE_SIZE;
         const endX = startX + SCREEN_WIDTH + TILE_SIZE;
         const endY = startY + SCREEN_HEIGHT + TILE_SIZE;
@@ -1023,8 +1053,12 @@ class DeadDropSociety {
     }
     
     drawEntities() {
-        // Draw dead drops
-        for (const drop of this.deadDrops) {
+        try {
+            if (!this.ctx || !this.cameraOffset) return;
+            
+            // Draw dead drops
+            for (const drop of this.deadDrops) {
+                if (!drop || !drop.cache) continue;
             if (drop.hidden && !drop.cache.discovered) continue;
             
             const drawPos = drop.cache.position.sub(this.cameraOffset);
@@ -1360,12 +1394,17 @@ class DeadDropSociety {
     }
     
     update(dt) {
-        if (this.state === GameState.MENU || this.state === GameState.GAME_OVER || this.state === GameState.VICTORY) {
-            return;
-        }
-        
-        // Update player
-        this.player.update(dt, this.keys);
+        try {
+            if (this.state === GameState.MENU || this.state === GameState.GAME_OVER || this.state === GameState.VICTORY) {
+                return;
+            }
+            
+            if (!this.player || !this.cameraOffset) return;
+            
+            // Update player
+            if (this.player && this.keys) {
+                this.player.update(dt, this.keys);
+            }
         this.player.sprinting = this.keys.ShiftLeft || this.keys.ShiftRight;
         
         // Update camera
@@ -1463,6 +1502,15 @@ class DeadDropSociety {
     }
     
     draw() {
+        // Safety checks
+        if (!this.ctx || !this.cameraOffset) {
+            console.error('Missing critical objects in draw()');
+            return;
+        }
+        if (!this.player) {
+            this.player = new Player(new Vector2(CITY_CENTER_X, CITY_CENTER_Y));
+        }
+        
         // Clear screen
         this.ctx.fillStyle = COLORS.background;
         this.ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -1492,47 +1540,97 @@ class DeadDropSociety {
             this.drawAlertMessages();
         }
         
-        // Update UI elements
-        const minutes = Math.floor(this.playTime / 60000).toString().padStart(2, '0');
-        const seconds = Math.floor((this.playTime % 60000) / 1000).toString().padStart(2, '0');
-        document.getElementById('time-display').textContent = `Time: ${minutes}:${seconds}`;
-        document.getElementById('score-display').textContent = `Score: ${this.score}`;
-        
-        if (this.player.scan_cooldown > 0) {
-            document.getElementById('scan-display').textContent = `Scan: ${(this.player.scan_cooldown / 1000).toFixed(1)}s`;
-        } else {
-            document.getElementById('scan-display').textContent = 'Scan: READY';
+        // Update UI elements safely
+        try {
+            const minutes = Math.floor(this.playTime / 60000).toString().padStart(2, '0');
+            const seconds = Math.floor((this.playTime % 60000) / 1000).toString().padStart(2, '0');
+            
+            const timeEl = document.getElementById('time-display');
+            const scoreEl = document.getElementById('score-display');
+            const scanEl = document.getElementById('scan-display');
+            const alertEl = document.getElementById('alert-display');
+            const stealthEl = document.getElementById('stealth-display');
+            
+            if (timeEl) timeEl.textContent = `Time: ${minutes}:${seconds}`;
+            if (scoreEl) scoreEl.textContent = `Score: ${this.score}`;
+            
+            if (scanEl && this.player) {
+                if (this.player.scan_cooldown > 0) {
+                    scanEl.textContent = `Scan: ${(this.player.scan_cooldown / 1000).toFixed(1)}s`;
+                } else {
+                    scanEl.textContent = 'Scan: READY';
+                }
+            }
+            
+            if (alertEl && this.player) {
+                alertEl.textContent = `Alert: ${Math.floor(this.player.alert_level)}%`;
+            }
+            
+            if (stealthEl && this.player) {
+                stealthEl.textContent = this.player.stealth_mode ? 'STEALTH' : 'NORMAL';
+            }
+        } catch (e) {
+            console.error('Error updating UI:', e);
         }
         
-        document.getElementById('alert-display').textContent = `Alert: ${Math.floor(this.player.alert_level)}%`;
-        document.getElementById('stealth-display').textContent = this.player.stealth_mode ? 'STEALTH' : 'NORMAL';
-        
-        // Show/hide overlays
-        document.getElementById('menu-overlay').style.display = 
-            this.state === GameState.MENU ? 'flex' : 'none';
-        document.getElementById('game-over-overlay').style.display = 
-            this.state === GameState.GAME_OVER ? 'flex' : 'none';
-        document.getElementById('victory-overlay').style.display = 
-            this.state === GameState.VICTORY ? 'flex' : 'none';
+        // Show/hide overlays safely
+        try {
+            const menuEl = document.getElementById('menu-overlay');
+            const gameOverEl = document.getElementById('game-over-overlay');
+            const victoryEl = document.getElementById('victory-overlay');
+            
+            if (menuEl) menuEl.style.display = this.state === GameState.MENU ? 'flex' : 'none';
+            if (gameOverEl) gameOverEl.style.display = this.state === GameState.GAME_OVER ? 'flex' : 'none';
+            if (victoryEl) victoryEl.style.display = this.state === GameState.VICTORY ? 'flex' : 'none';
+        } catch (e) {
+            console.error('Error updating overlays:', e);
+        }
     }
     
     gameLoop(timestamp) {
-        if (!this.running) return;
-        
-        const dt = Math.min(timestamp - this.lastTime, 100);
-        this.lastTime = timestamp;
-        
-        if (this.state === GameState.PLAYING) {
-            this.update(dt);
+        try {
+            if (!this.running) return;
+            
+            const dt = Math.min(timestamp - this.lastTime, 100);
+            this.lastTime = timestamp;
+            
+            if (this.state === GameState.PLAYING) {
+                this.update(dt);
+            }
+            
+            this.draw();
+            
+            requestAnimationFrame((t) => this.gameLoop(t));
+        } catch (e) {
+            console.error('Error in gameLoop:', e);
+            this.running = false;
+            if (this.ctx) {
+                this.ctx.fillStyle = 'red';
+                this.ctx.font = '24px Arial';
+                this.ctx.fillText('CRITICAL ERROR: ' + e.message, 50, 100);
+            }
         }
-        
-        this.draw();
-        
-        requestAnimationFrame((t) => this.gameLoop(t));
     }
 }
 
 // Start the game when loaded
 window.addEventListener('load', () => {
-    new DeadDropSociety();
+    try {
+        new DeadDropSociety();
+    } catch (e) {
+        console.error('Failed to start game:', e);
+        const canvas = document.getElementById('game-canvas');
+        if (canvas) {
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+                canvas.width = SCREEN_WIDTH;
+                canvas.height = SCREEN_HEIGHT;
+                ctx.fillStyle = 'black';
+                ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+                ctx.fillStyle = 'red';
+                ctx.font = '24px Arial';
+                ctx.fillText('Failed to start: ' + e.message, 50, 100);
+            }
+        }
+    }
 });
