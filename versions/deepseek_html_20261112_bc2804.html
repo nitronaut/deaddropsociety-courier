@@ -1,0 +1,2482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DEAD DROP // DDS COURIER</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden;
+    font-family:ui-monospace,Menlo,Consolas,monospace;cursor:crosshair;}
+  canvas{display:block;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+"use strict";
+
+/* ============================================================
+   CANVAS
+   ============================================================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+}
+window.addEventListener('resize', resize); resize();
+
+/* ============================================================
+   UTIL
+   ============================================================ */
+const TAU = Math.PI * 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const rndInt = (a, b) => Math.floor(rand(a, b + 1));
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const angDiff = (a, b) => { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+function pad(n){ return (n < 10 ? '0' : '') + n; }
+
+/* ============================================================
+   AUDIO
+   ============================================================ */
+let actx = null;
+function audioInit(){
+  if (!actx){
+    try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){ actx = null; }
+  }
+  if (actx && actx.state === 'suspended'){ try { actx.resume(); } catch(e){} }
+}
+function beep(freq, dur, type, vol, slide){
+  if (!actx) return;
+  try {
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, slide), actx.currentTime + dur);
+    g.gain.value = 0.0001;
+    g.gain.exponentialRampToValueAtTime(vol || 0.06, actx.currentTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur + 0.02);
+  } catch(e){}
+}
+
+/* ============================================================
+   LOOT DEFINITIONS
+   ============================================================ */
+const WEAPON_DEFS = {
+  smg:   { name:'VECTOR SMG',    col:'#ff6b3d', desc:'Rapid fire projectile' },
+  taser: { name:'GHOST TASER',   col:'#ffd23f', desc:'Close-range stun' },
+  emp:   { name:'PULSE EMP',     col:'#3df0ff', desc:'Area disable' }
+};
+const TRANSPORT_DEFS = {
+  runner:   { name:'PACE RUNNER',    col:'#3df0ff', desc:'+base movement speed' },
+  sprinter: { name:'VECTOR SPRINT',  col:'#ffd23f', desc:'+sprint speed & stealth' },
+  ghost:    { name:'GHOST CROUCH',   col:'#2bff88', desc:'+crouch speed & stealth' }
+};
+const COMM_DEFS = {
+  reset:  { name:'SPIDERPHONE: RESET',  col:'#ffd23f', key:'Q', desc:'Reset nearest drop freshness' },
+  spawn:  { name:'SPIDERPHONE: SPAWN',  col:'#ff6b3d', key:'F', desc:'Deploy a new dead drop' },
+  remote: { name:'SPIDERPHONE: REMOTE', col:'#2bff88', key:'G', desc:'Resolve nearest drop remotely' }
+};
+const FINANCE_DEFS = {
+  small:  { name:'OPIUM LOT ×1', col:'#b873ff', value: 1,  weight: 50 },
+  medium: { name:'OPIUM LOT ×5', col:'#8a3dff', value: 5,  weight: 35 },
+  large:  { name:'OPIUM LOT ×15', col:'#d94bff', value: 15, weight: 15 }
+};
+
+const MAX_WEAPON_LVL = 3;
+const MAX_TRANSPORT_LVL = 3;
+const MAX_COMM_COUNT = 5;
+const LOOT_CHANCE = 0.72;
+const WEAPON_ORDER = ['smg', 'taser', 'emp'];
+
+const SUBWAY_COST_PER_STOP = 10;
+
+/* ============================================================
+   WORLD
+   ============================================================ */
+const CELL = 280, COLS = 16, ROWS = 12, ROAD = 52;
+const WW = COLS * CELL, WH = ROWS * CELL;
+
+const DISTRICTS = [
+  { name:'DOWNTOWN', ground:'#080b12', edge:'#2de2ff', a:0.75 },
+  { name:'MIDTOWN',  ground:'#090b12', edge:'#8a6bff', a:0.65 },
+  { name:'SUBURBS',  ground:'#070d0b', edge:'#39d98a', a:0.45 },
+  { name:'EXURBS',   ground:'#0b0b08', edge:'#c9a227', a:0.38 },
+];
+
+function districtAt(i){
+  const u = i / COLS;
+  if (u < 0.28) return 0;
+  if (u < 0.56) return 1;
+  if (u < 0.82) return 2;
+  return 3;
+}
+
+let cells = [];
+
+function rectsForBlock(d, x0, y0, W0, H0){
+  const r = [];
+  if (d === 0){
+    if (Math.random() < 0.42){
+      const w1 = W0 * rand(0.34, 0.48);
+      r.push([x0, y0, w1 - 5, H0]);
+      r.push([x0 + w1 + 5, y0, W0 - w1 - 5, H0]);
+    } else r.push([x0, y0, W0, H0]);
+  } else if (d === 1){
+    const lw = W0 / 2, lh = H0 / 2;
+    for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++){
+      if (Math.random() < 0.22) continue;
+      const pw = lw * rand(0.62, 0.92), ph = lh * rand(0.62, 0.92);
+      r.push([x0 + a*lw + (lw-pw)/2, y0 + b*lh + (lh-ph)/2, pw, ph]);
+    }
+  } else if (d === 2){
+    const lw = W0 / 2, lh = H0 / 2;
+    for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++){
+      if (Math.random() < 0.14) continue;
+      const pw = lw * rand(0.46, 0.68), ph = lh * rand(0.46, 0.68);
+      r.push([x0 + a*lw + (lw-pw)/2, y0 + b*lh + (lh-ph)/2, pw, ph]);
+    }
+  } else {
+    const n = Math.random() < 0.45 ? 0 : (Math.random() < 0.65 ? 1 : 2);
+    for (let k = 0; k < n; k++){
+      const pw = W0 * rand(0.22, 0.42), ph = H0 * rand(0.22, 0.42);
+      r.push([x0 + Math.random()*(W0-pw), y0 + Math.random()*(H0-ph), pw, ph]);
+    }
+  }
+  return r;
+}
+
+function genWorld(){
+  cells = [];
+  for (let i = 0; i < COLS; i++){
+    cells[i] = [];
+    for (let j = 0; j < ROWS; j++){
+      const d = districtAt(i);
+      const x0 = i*CELL + ROAD, y0 = j*CELL + ROAD;
+      const bw = CELL - 2*ROAD, bh = CELL - 2*ROAD;
+      cells[i][j] = { d, buildings: rectsForBlock(d, x0, y0, bw, bh).map(r => ({ x:r[0], y:r[1], w:r[2], h:r[3] })) };
+    }
+  }
+}
+
+function solidAt(x, y){
+  const i = Math.floor(x / CELL), j = Math.floor(y / CELL);
+  if (i < 0 || j < 0 || i >= COLS || j >= ROWS) return true;
+  for (const b of cells[i][j].buildings){
+    if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) return true;
+  }
+  return false;
+}
+
+function losClear(a, b){
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const steps = Math.ceil(Math.hypot(dx, dy) / 14);
+  for (let i = 1; i < steps; i++){
+    const t = i / steps;
+    if (solidAt(a.x + dx*t, a.y + dy*t)) return false;
+  }
+  return true;
+}
+
+function randomRoadPoint(){
+  let x, y;
+  if (Math.random() < 0.5){
+    y = rndInt(0, ROWS)*CELL + rand(-38, 38);
+    x = rand(220, WW - 220);
+  } else {
+    x = rndInt(0, COLS)*CELL + rand(-38, 38);
+    y = rand(220, WH - 220);
+  }
+  return { x: clamp(x, 90, WW - 90), y: clamp(y, 90, WH - 90) };
+}
+
+/* ---------- SUBWAY SYSTEM ---------- */
+let subway = null;
+
+function buildSubway(){
+  // 4 stops zigzagging east-west across the map
+  // We want stops to be roughly evenly spaced horizontally, at varying vertical positions
+  // so the track visibly zigzags.
+  const stops = [
+    { k: 1,  m: 2 },  // left, north
+    { k: 5,  m: 8 },  // left-center, south
+    { k: 10, m: 3 },  // right-center, north
+    { k: 14, m: 9 },  // right, south
+  ].map(s => {
+    const p = nodePos(s.k, s.m);
+    return { x: p.x, y: p.y, k: s.k, m: s.m };
+  });
+
+  // Build track segments (straight lines between stops)
+  const segments = [];
+  for (let i = 0; i < stops.length - 1; i++){
+    segments.push({ a: stops[i], b: stops[i + 1], cost: SUBWAY_COST_PER_STOP });
+  }
+
+  subway = { stops, segments };
+}
+
+function subwayStationAt(x, y){
+  if (!subway) return -1;
+  for (let i = 0; i < subway.stops.length; i++){
+    if (dist(subway.stops[i], { x, y }) < 90) return i;
+  }
+  return -1;
+}
+
+/* ---------- road graph ---------- */
+const GW = COLS + 1, GH = ROWS + 1;
+const nodeIdx = (k, m) => m*GW + k;
+const nodePos = (k, m) => ({ x: k*CELL, y: m*CELL });
+function nearestNode(x, y){ return { k: clamp(Math.round(x/CELL),0,COLS), m: clamp(Math.round(y/CELL),0,ROWS) }; }
+function bfsPath(sk, sm, gk, gm){
+  const s = nodeIdx(sk, sm), g = nodeIdx(gk, gm);
+  if (s === g) return [[gk, gm]];
+  const prev = new Int32Array(GW*GH).fill(-1);
+  const seen = new Uint8Array(GW*GH);
+  const q = [s]; seen[s] = 1;
+  let head = 0, found = false;
+  while (head < q.length){
+    const cur = q[head++];
+    if (cur === g){ found = true; break; }
+    const k = cur % GW, m = (cur - k) / GW;
+    const nb = [[k-1,m],[k+1,m],[k,m-1],[k,m+1]];
+    for (let n = 0; n < 4; n++){
+      const nk = nb[n][0], nm = nb[n][1];
+      if (nk < 0 || nm < 0 || nk >= GW || nm >= GH) continue;
+      const ni = nodeIdx(nk, nm);
+      if (seen[ni]) continue;
+      seen[ni] = 1; prev[ni] = cur; q.push(ni);
+    }
+  }
+  if (!found) return [];
+  const path = [];
+  let c = g;
+  while (c !== -1){ const k = c % GW, m = (c-k)/GW; path.push([k, m]); c = prev[c]; }
+  path.reverse();
+  return path;
+}
+
+/* ============================================================
+   STATE
+   ============================================================ */
+let player, cam, drops, terminals, rivals, pulses, particles, effects, bullets;
+let phase, heat, cycleNum, scanCd, primaryId, action, messages;
+let gameState, endTimer, spawnTimer, shakeT, shakeMag, stat;
+let persistent;
+let subwayRide = null;
+let subwayMsgT = 0;
+
+const PRIMARY_COL = '#ff2d95';
+const DROP_COL    = '#ffd23f';
+const TERM_COL    = '#2bff88';
+const PLAYER_COL  = '#3df0ff';
+const SUBWAY_COL  = '#b873ff';
+
+const mouse = { x: 0, y: 0, wx: 0, wy: 0, down: false };
+const keys = {};
+
+function message(text, col, dur){
+  messages.push({ text, col: col || '#cfe9ff', t: 0, dur: dur || 3.2 });
+}
+
+function initPersistent(){
+  persistent = {
+    score: 0,
+    credits: 0, // Opium Lots
+    loot: {
+      weapons:   { smg:0, taser:0, emp:0 },
+      transport: { runner:0, sprinter:0, ghost:0 },
+      comms:     { reset:0, spawn:0, remote:0 }
+    }
+  };
+}
+function wipePersistent(){
+  const lostScore = persistent.score;
+  const lostCredits = persistent.credits;
+  initPersistent();
+  return { score: lostScore, credits: lostCredits };
+}
+
+/* ============================================================
+   TRANSPORT BONUSES
+   ============================================================ */
+function moveSpeedBonus(){
+  const l = persistent.loot.transport.runner;
+  return 1 + 0.06 * l;
+}
+function sprintBonus(){
+  const l = persistent.loot.transport.sprinter;
+  return { speed: 1 + 0.08 * l, vis: 1 - 0.06 * l };
+}
+function crouchBonus(){
+  const l = persistent.loot.transport.ghost;
+  return { speed: 1 + 0.10 * l, vis: 1 - 0.06 * l };
+}
+
+/* ============================================================
+   MISSION
+   ============================================================ */
+function newMission(){
+  phase = 'LOCATE';
+  heat = 0;
+  scanCd = 0;
+  primaryId = null;
+  action = { active:false, type:null, target:null, progress:0, duration:0 };
+  messages = [];
+  pulses = [];
+  particles = [];
+  effects = [];
+  bullets = [];
+  rivals = [];
+  spawnTimer = 0;
+  endTimer = 0;
+  shakeT = 0; shakeMag = 0;
+  subwayRide = null;
+  subwayMsgT = 0;
+  stat = { updated: 0, lost: 0, score: 0 };
+
+  player = {
+    x: Math.floor(COLS/2)*CELL,
+    y: Math.floor(ROWS/2)*CELL,
+    r: 11, hp: 100, maxHp: 100,
+    angle: -Math.PI/2,
+    crouch: false, sprint: false,
+    hurtT: 0,
+    activeWeapon: null,
+    weaponCd: { smg:0, taser:0, emp:0 }
+  };
+  cam = { x: player.x - W/2, y: player.y - H/2 };
+
+  for (const k of WEAPON_ORDER){
+    if (persistent.loot.weapons[k] > 0){ player.activeWeapon = k; break; }
+  }
+
+  const n = Math.min(10, 6 + cycleNum);
+  drops = [];
+  const placed = [];
+  for (let i = 0; i < n; i++){
+    let p, tries = 0;
+    do { p = randomRoadPoint(); tries++; }
+    while (tries < 80 && placed.some(q => dist(q, p) < 380));
+    placed.push(p);
+    drops.push({
+      id: i, x: p.x, y: p.y,
+      fresh: rand(72, 100),
+      decay: rand(0.24, 0.55) * (1 + cycleNum * 0.13),
+      known: false, resolved: false, updated: false, lost: false,
+      pulseOff: rand(0, TAU), fx: 0
+    });
+  }
+
+  terminals = [];
+  const tSpots = [{k:3,m:3},{k:12,m:2},{k:8,m:9},{k:14,m:8}];
+  for (let i = 0; i < 3; i++){
+    const s = tSpots[(i*2 + cycleNum) % tSpots.length];
+    const pos = nodePos(s.k, s.m);
+    terminals.push({ x: pos.x + 26, y: pos.y + 26, used: false, pulse: rand(0, TAU) });
+  }
+
+  const startRivals = Math.min(14, 5 + cycleNum * 2);
+  for (let i = 0; i < startRivals; i++) spawnRival(true);
+
+  message('CYCLE ' + (cycleNum + 1) + ' // DDS UPLINK ACTIVE', '#3df0ff', 4);
+  message('SCAN [SPACE] TO LOCATE DEAD DROPS', '#ffd23f', 5);
+  if (persistent.score > 0){
+    message('TOTAL SCORE CARRIED: ' + persistent.score, '#2bff88', 4);
+  }
+  if (persistent.credits > 0){
+    message('OPIUM LOTS: ' + persistent.credits, SUBWAY_COL, 4);
+  }
+  message('SUBWAY ONLINE // [H] RIDE THE LINE', SUBWAY_COL, 5);
+}
+
+function spawnRival(far){
+  const cap = Math.min(16, 6 + cycleNum * 2 + Math.floor(heat / 16));
+  if (rivals.length >= cap) return;
+  let p, tries = 0;
+  do { p = nodePos(rndInt(0, COLS), rndInt(0, ROWS)); tries++; }
+  while (tries < 60 && far && dist(p, player) < 1100);
+
+  const nn = nearestNode(p.x, p.y);
+  rivals.push({
+    x: p.x, y: p.y, r: 10,
+    angle: rand(0, TAU),
+    state: 'patrol', awareness: 0,
+    hp: 140, maxHp: 140,
+    stunT: 0,
+    viewDist: 360, fov: 1.85,
+    path: [], pathT: 0,
+    k: nn.k, m: nn.m,
+    lastKnown: null, loseT: 0,
+    marked: 0, alive: true
+  });
+}
+
+/* ============================================================
+   SUBWAY RIDE LOGIC
+   ============================================================ */
+function startSubwayRide(destIdx){
+  if (!subway) return;
+  const fromIdx = subwayStationAt(player.x, player.y);
+  if (fromIdx < 0){
+    message('NOT AT A SUBWAY STATION', '#5a6b7c', 2);
+    return;
+  }
+  if (destIdx === fromIdx){
+    message('ALREADY AT THIS STATION', '#5a6b7c', 2);
+    return;
+  }
+
+  // Compute stops travelled (line is linear: A-B-C-D)
+  const stopsTravelled = Math.abs(destIdx - fromIdx);
+  const cost = stopsTravelled * SUBWAY_COST_PER_STOP;
+
+  if (persistent.credits < cost){
+    message('NEED ' + cost + ' OPIUM LOTS (' + stopsTravelled + ' STOPS)', '#ff3b30', 3.5);
+    beep(180, 0.2, 'sawtooth', 0.04, 80);
+    return;
+  }
+
+  persistent.credits -= cost;
+  message('SUBWAY RIDE: ' + stopsTravelled + ' STOPS // -' + cost + ' OPIUM LOTS', SUBWAY_COL, 4);
+  beep(330, 0.2, 'sine', 0.05, 660);
+  setTimeout(() => beep(660, 0.3, 'sine', 0.05, 990), 180);
+
+  const dest = subway.stops[destIdx];
+  subwayRide = {
+    from: { x: player.x, y: player.y },
+    to: { x: dest.x, y: dest.y },
+    t: 0,
+    duration: 1.6 + stopsTravelled * 0.35,
+    totalStops: stopsTravelled
+  };
+
+  // Clear any in-progress action
+  action.active = false;
+  action.progress = 0;
+
+  // Mark rivals temporarily disabled along the ride (they can't catch the train)
+  for (const r of rivals){
+    r.state = 'patrol';
+    r.awareness = 0;
+    r.lastKnown = null;
+    r.path = [];
+    r.pathT = 0;
+    r.marked = 0;
+  }
+}
+
+function updateSubwayRide(dt){
+  if (!subwayRide) return;
+  subwayRide.t += dt;
+  const k = clamp(subwayRide.t / subwayRide.duration, 0, 1);
+
+  // Player follows the actual track: walk through intermediate stops
+  const fromIdx = subway.stops.findIndex(s => dist(s, subwayRide.from) < 1);
+  const destIdx = subway.stops.findIndex(s => dist(s, subwayRide.to) < 1);
+  // Fallback: interpolate directly
+  if (fromIdx < 0 || destIdx < 0){
+    player.x = lerp(subwayRide.from.x, subwayRide.to.x, k);
+    player.y = lerp(subwayRide.from.y, subwayRide.to.y, k);
+  } else {
+    // Walk along the stop chain
+    const dir = destIdx > fromIdx ? 1 : -1;
+    const totalLegs = Math.abs(destIdx - fromIdx);
+    const legProgress = k * totalLegs;
+    const legIdx = Math.min(Math.floor(legProgress), totalLegs - 1);
+    const legT = legProgress - legIdx;
+    const a = subway.stops[fromIdx + dir * legIdx];
+    const b = subway.stops[fromIdx + dir * (legIdx + 1)];
+    player.x = lerp(a.x, b.x, legT);
+    player.y = lerp(a.y, b.y, legT);
+  }
+
+  // Camera follows
+  cam.x = lerp(cam.x, player.x - W/2, 1 - Math.pow(0.0001, dt));
+  cam.y = lerp(cam.y, player.y - H/2, 1 - Math.pow(0.0001, dt));
+
+  // Trail particles
+  if (Math.random() < 0.5){
+    particles.push({
+      x: player.x + rand(-10, 10), y: player.y + rand(-10, 10),
+      vx: rand(-40, 40), vy: rand(-40, 40),
+      life: 0.6, col: SUBWAY_COL
+    });
+  }
+
+  if (subwayRide.t >= subwayRide.duration){
+    subwayRide = null;
+    message('SUBWAY ARRIVED', SUBWAY_COL, 2.5);
+    beep(880, 0.2, 'sine', 0.05, 440);
+  }
+}
+
+/* ============================================================
+   INPUT
+   ============================================================ */
+window.addEventListener('keydown', e => {
+  audioInit();
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyE','KeyQ','KeyF','KeyG','KeyH','Digit1','Digit2','Digit3','Digit4'].includes(e.code)) e.preventDefault();
+
+  if (gameState === 'TITLE' && e.code === 'Space'){
+    gameState = 'PLAY';
+    cycleNum = 0;
+    initPersistent();
+    newMission();
+    return;
+  }
+
+  if (gameState === 'END'){
+    if (e.code === 'KeyR'){ cycleNum++; gameState = 'PLAY'; newMission(); }
+    return;
+  }
+  if (gameState === 'FAIL'){
+    if (e.code === 'KeyR'){ cycleNum = 0; wipePersistent(); gameState = 'PLAY'; newMission(); }
+    return;
+  }
+
+  // Subway
+  if (e.code === 'KeyH'){
+    if (subwayRide) return;
+    const here = subwayStationAt(player.x, player.y);
+    if (here < 0){
+      message('NOT AT A SUBWAY STATION', '#5a6b7c', 2);
+      return;
+    }
+    // Cycle to next station in the line
+    const next = (here + 1) % subway.stops.length;
+    startSubwayRide(next);
+    return;
+  }
+
+  // Weapon switch
+  if (e.code === 'Digit1') selectWeapon('smg');
+  if (e.code === 'Digit2') selectWeapon('taser');
+  if (e.code === 'Digit3') selectWeapon('emp');
+
+  // Spiderphones
+  if (e.code === 'KeyQ') useSpiderphone('reset');
+  if (e.code === 'KeyF') useSpiderphone('spawn');
+  if (e.code === 'KeyG') useSpiderphone('remote');
+}, { passive:false });
+
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; mouse.down = false; });
+
+window.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+window.addEventListener('mousedown', e => { if (e.button === 0){ mouse.down = true; audioInit(); } });
+window.addEventListener('mouseup', e => { if (e.button === 0) mouse.down = false; });
+window.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('wheel', e => {
+  if (gameState !== 'PLAY') return;
+  e.preventDefault();
+  const dir = e.deltaY > 0 ? 1 : -1;
+  let idx = WEAPON_ORDER.indexOf(player.activeWeapon);
+  if (idx === -1) idx = 0;
+  for (let step = 1; step <= WEAPON_ORDER.length; step++){
+    const next = WEAPON_ORDER[(idx + dir*step + WEAPON_ORDER.length*2) % WEAPON_ORDER.length];
+    if (persistent.loot.weapons[next] > 0){ selectWeapon(next); break; }
+  }
+}, { passive:false });
+
+function selectWeapon(type){
+  const lvl = persistent.loot.weapons[type];
+  if (lvl <= 0){
+    message('WEAPON LOCKED — FIND ' + WEAPON_DEFS[type].name + ' BLUEPRINT', '#5a6b7c', 2.2);
+    return;
+  }
+  player.activeWeapon = type;
+  message('EQUIPPED: ' + WEAPON_DEFS[type].name + ' L' + lvl, WEAPON_DEFS[type].col, 2.2);
+  beep(520, 0.06, 'square', 0.04);
+}
+
+/* ============================================================
+   SPIDERPHONES
+   ============================================================ */
+function useSpiderphone(type){
+  if (gameState !== 'PLAY') return;
+  if (subwayRide) return;
+  if (persistent.loot.comms[type] <= 0){
+    message('NO ' + COMM_DEFS[type].name, '#5a6b7c', 2);
+    return;
+  }
+  if (type === 'reset'){
+    let best = null, bd = 1e9;
+    for (const d of drops){
+      if (d.resolved) continue;
+      const dd = dist(d, player);
+      if (dd < bd){ bd = dd; best = d; }
+    }
+    if (!best){ message('NO ACTIVE DROPS', '#5a6b7c', 2); return; }
+    best.fresh = 100;
+    best.known = true;
+    persistent.loot.comms.reset--;
+    message('SPIDERPHONE // DD-' + pad(best.id) + ' FRESHNESS RESTORED', COMM_DEFS.reset.col, 3.4);
+    beep(880, 0.2, 'sine', 0.05);
+    effects.push({ x: best.x, y: best.y, r: 0, max: 100, col: COMM_DEFS.reset.col, life: 0.7, maxLife: 0.7 });
+  }
+  else if (type === 'spawn'){
+    if (drops.length >= 15){ message('DROP LIMIT REACHED', '#5a6b7c', 2); return; }
+    const p = randomRoadPoint();
+    const id = drops.length ? Math.max(...drops.map(d => d.id)) + 1 : 0;
+    drops.push({
+      id, x: p.x, y: p.y,
+      fresh: 100, decay: rand(0.24, 0.55) * (1 + cycleNum * 0.13),
+      known: true, resolved: false, updated: false, lost: false,
+      pulseOff: rand(0, TAU), fx: 1
+    });
+    persistent.loot.comms.spawn--;
+    message('SPIDERPHONE // NEW DROP DD-' + pad(id) + ' DEPLOYED', COMM_DEFS.spawn.col, 3.4);
+    beep(660, 0.25, 'square', 0.05);
+    effects.push({ x: p.x, y: p.y, r: 0, max: 120, col: COMM_DEFS.spawn.col, life: 0.8, maxLife: 0.8 });
+  }
+  else if (type === 'remote'){
+    let best = null, bd = 1e9;
+    for (const d of drops){
+      if (d.resolved) continue;
+      const dd = dist(d, player);
+      if (dd < bd){ bd = dd; best = d; }
+    }
+    if (!best){ message('NO ACTIVE DROPS', '#5a6b7c', 2); return; }
+    best.resolved = true; best.updated = true; best.known = true;
+    stat.updated++;
+    stat.score += Math.round(best.fresh);
+    persistent.loot.comms.remote--;
+    message('SPIDERPHONE // DD-' + pad(best.id) + ' REMOTE UPDATED', COMM_DEFS.remote.col, 3.4);
+    beep(990, 0.25, 'square', 0.05);
+    effects.push({ x: best.x, y: best.y, r: 0, max: 130, col: COMM_DEFS.remote.col, life: 0.9, maxLife: 0.9 });
+    rollLoot(best.x, best.y);
+  }
+}
+
+/* ============================================================
+   LOOT
+   ============================================================ */
+function rollLoot(x, y){
+  if (Math.random() > LOOT_CHANCE) return;
+
+  const roll = Math.random();
+  let result = null;
+
+  // 30% weapons, 22% transport, 18% comms, 30% finance
+  if (roll < 0.30){
+    const types = Object.keys(WEAPON_DEFS);
+    const avail = types.filter(t => persistent.loot.weapons[t] < MAX_WEAPON_LVL);
+    const type = avail.length ? avail[Math.floor(Math.random()*avail.length)] : types[Math.floor(Math.random()*types.length)];
+    if (persistent.loot.weapons[type] < MAX_WEAPON_LVL){
+      persistent.loot.weapons[type]++;
+      result = { kind:'weapon', type, level: persistent.loot.weapons[type] };
+    } else {
+      persistent.score += 100;
+      result = { kind:'bonus', text:'+100 // MAXED WEAPON SALVAGE' };
+    }
+  }
+  else if (roll < 0.52){
+    const types = Object.keys(TRANSPORT_DEFS);
+    const avail = types.filter(t => persistent.loot.transport[t] < MAX_TRANSPORT_LVL);
+    const type = avail.length ? avail[Math.floor(Math.random()*avail.length)] : types[Math.floor(Math.random()*types.length)];
+    if (persistent.loot.transport[type] < MAX_TRANSPORT_LVL){
+      persistent.loot.transport[type]++;
+      result = { kind:'transport', type, level: persistent.loot.transport[type] };
+    } else {
+      persistent.score += 100;
+      result = { kind:'bonus', text:'+100 // MAXED TRANSPORT SALVAGE' };
+    }
+  }
+  else if (roll < 0.70){
+    const types = Object.keys(COMM_DEFS);
+    const avail = types.filter(t => persistent.loot.comms[t] < MAX_COMM_COUNT);
+    const type = avail.length ? avail[Math.floor(Math.random()*avail.length)] : types[Math.floor(Math.random()*types.length)];
+    if (persistent.loot.comms[type] < MAX_COMM_COUNT){
+      persistent.loot.comms[type]++;
+      result = { kind:'comm', type };
+    } else {
+      persistent.score += 50;
+      result = { kind:'bonus', text:'+50 // MAXED COMM SALVAGE' };
+    }
+  }
+  else {
+    // Finance: weighted pick of small/medium/large Opium Lots
+    const keys = Object.keys(FINANCE_DEFS);
+    let totalW = 0;
+    for (const k of keys) totalW += FINANCE_DEFS[k].weight;
+    let pick = Math.random() * totalW;
+    let chosen = keys[0];
+    for (const k of keys){
+      pick -= FINANCE_DEFS[k].weight;
+      if (pick <= 0){ chosen = k; break; }
+    }
+    const def = FINANCE_DEFS[chosen];
+    persistent.credits += def.value;
+    result = { kind:'finance', type: chosen, value: def.value };
+  }
+
+  if (!result) return;
+
+  if (result.kind === 'weapon'){
+    const d = WEAPON_DEFS[result.type];
+    message('◆ WEAPON BLUEPRINT: ' + d.name + '  L' + result.level, d.col, 4);
+    beep(660, 0.08, 'square', 0.05);
+    setTimeout(() => beep(990, 0.12, 'square', 0.05), 80);
+  } else if (result.kind === 'transport'){
+    const d = TRANSPORT_DEFS[result.type];
+    message('◆ TRANSPORT BLUEPRINT: ' + d.name + '  L' + result.level, d.col, 4);
+    beep(660, 0.08, 'square', 0.05);
+    setTimeout(() => beep(990, 0.12, 'square', 0.05), 80);
+  } else if (result.kind === 'comm'){
+    const d = COMM_DEFS[result.type];
+    message('◆ COMMS: ' + d.name + '  +1', d.col, 4);
+    beep(880, 0.1, 'sine', 0.05);
+  } else if (result.kind === 'finance'){
+    const d = FINANCE_DEFS[result.type];
+    message('◆ ' + d.name + '  (' + result.value + ' OPIUM LOTS)', d.col, 4);
+    beep(740, 0.1, 'sine', 0.05);
+    setTimeout(() => beep(1100, 0.14, 'sine', 0.05), 90);
+  } else {
+    message('◆ ' + result.text, '#2bff88', 3);
+  }
+
+  const col = result.kind === 'weapon' ? WEAPON_DEFS[result.type].col
+            : result.kind === 'transport' ? TRANSPORT_DEFS[result.type].col
+            : result.kind === 'comm' ? COMM_DEFS[result.type].col
+            : result.kind === 'finance' ? FINANCE_DEFS[result.type].col
+            : '#2bff88';
+  for (let i = 0; i < 24; i++){
+    particles.push({
+      x, y,
+      vx: rand(-160, 160), vy: rand(-160, 160),
+      life: rand(0.4, 1.0),
+      col
+    });
+  }
+
+  if (result.kind === 'weapon' && !player.activeWeapon){
+    player.activeWeapon = result.type;
+    message('AUTO-EQUIPPED: ' + WEAPON_DEFS[result.type].name, WEAPON_DEFS[result.type].col, 3);
+  }
+}
+
+/* ============================================================
+   UPDATE
+   ============================================================ */
+function update(dt){
+  mouse.wx = mouse.x + cam.x;
+  mouse.wy = mouse.y + cam.y;
+
+  shakeT = Math.max(0, shakeT - dt);
+  subwayMsgT = Math.max(0, subwayMsgT - dt);
+
+  for (let i = messages.length - 1; i >= 0; i--){
+    messages[i].t += dt;
+    if (messages[i].t > messages[i].dur) messages.splice(i, 1);
+  }
+
+  // Subway ride: lock player movement
+  if (subwayRide){
+    updateSubwayRide(dt);
+    // Rivals keep patrolling (they just can't catch the train)
+    for (const r of rivals){
+      if (!r.alive) continue;
+      updateRival(r, dt);
+    }
+    rivals = rivals.filter(r => r.alive);
+    // Update visuals/effects during ride
+    for (let i = particles.length - 1; i >= 0; i--){
+      const p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.94; p.vy *= 0.94;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+    for (let i = pulses.length - 1; i >= 0; i--){
+      const p = pulses[i];
+      p.r += 2300 * dt;
+      p.alpha = 1 - p.r / p.max;
+      if (p.r >= p.max) pulses.splice(i, 1);
+    }
+    for (let i = effects.length - 1; i >= 0; i--){
+      const e = effects[i];
+      e.r += (e.max / e.maxLife) * dt * 3;
+      e.life -= dt;
+      if (e.life <= 0) effects.splice(i, 1);
+    }
+    return;
+  }
+
+  /* ---------- Player movement ---------- */
+  let mx = 0, my = 0;
+  if (keys['KeyW'] || keys['ArrowUp']) my--;
+  if (keys['KeyS'] || keys['ArrowDown']) my++;
+  if (keys['KeyA'] || keys['ArrowLeft']) mx--;
+  if (keys['KeyD'] || keys['ArrowRight']) mx++;
+  const mag = Math.hypot(mx, my);
+  if (mag > 0){ mx /= mag; my /= mag; }
+
+  player.crouch = !!keys['KeyC'];
+  player.sprint = !!keys['ShiftLeft'] && !player.crouch;
+
+  let baseSpeed = 205 * moveSpeedBonus();
+  let speed = baseSpeed;
+  if (player.crouch) speed = 105 * moveSpeedBonus() * crouchBonus().speed;
+  else if (player.sprint) speed = 330 * moveSpeedBonus() * sprintBonus().speed;
+
+  player.x += mx * speed * dt;
+  player.y += my * speed * dt;
+  resolveCollision(player, player.r);
+  player.x = clamp(player.x, player.r, WW - player.r);
+  player.y = clamp(player.y, player.r, WH - player.r);
+
+  player.angle = Math.atan2(mouse.wy - player.y, mouse.wx - player.x);
+
+  /* ---------- Weapon firing ---------- */
+  for (const k of WEAPON_ORDER){
+    player.weaponCd[k] = Math.max(0, player.weaponCd[k] - dt);
+  }
+  if (mouse.down && player.activeWeapon && persistent.loot.weapons[player.activeWeapon] > 0){
+    fireWeapon(player.activeWeapon);
+  }
+
+  /* ---------- Bullets ---------- */
+  for (let i = bullets.length - 1; i >= 0; i--){
+    const b = bullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0 || solidAt(b.x, b.y)){
+      if (b.life > 0){
+        for (let k = 0; k < 4; k++){
+          particles.push({ x:b.x, y:b.y, vx:rand(-40,40), vy:rand(-40,40), life:0.25, col:'#ffd23f' });
+        }
+      }
+      bullets.splice(i, 1);
+      continue;
+    }
+    let hit = false;
+    for (const r of rivals){
+      if (r.stunT > 0 || !r.alive) continue;
+      if (dist(b, r) < r.r + 4){
+        r.hp -= b.damage;
+        for (let k = 0; k < 6; k++){
+          particles.push({ x:b.x, y:b.y, vx:rand(-80,80), vy:rand(-80,80), life:0.4, col:'#ff3b30' });
+        }
+        if (r.hp <= 0){
+          r.alive = false;
+          persistent.score += 50;
+          message('RIVAL NEUTRALIZED // +50', '#ff3b30', 2.4);
+          beep(180, 0.25, 'sawtooth', 0.05, 60);
+          for (let k = 0; k < 20; k++){
+            particles.push({ x:r.x, y:r.y, vx:rand(-120,120), vy:rand(-120,120), life:rand(0.4,0.9), col:'#ff3b30' });
+          }
+        }
+        hit = true;
+        break;
+      }
+    }
+    if (hit) bullets.splice(i, 1);
+  }
+
+  /* ---------- Scan ---------- */
+  scanCd = Math.max(0, scanCd - dt);
+  if (keys['Space'] && scanCd <= 0){
+    scanCd = 2.6;
+    pulses.push({ x: player.x, y: player.y, r: 0, max: 1450, alpha: 1 });
+    heat = Math.min(100, heat + 9);
+    beep(880, 0.28, 'sine', 0.05, 220);
+    beep(1320, 0.14, 'triangle', 0.03, 660);
+
+    let best = null, bestF = -1;
+    for (const d of drops){
+      if (d.resolved) continue;
+      if (dist(d, player) < 1450){
+        if (!d.known){ d.known = true; d.fx = 1; }
+        if (d.fresh > bestF){ bestF = d.fresh; best = d; }
+      }
+    }
+    if (!best){
+      for (const d of drops){
+        if (d.resolved) continue;
+        if (d.fresh > bestF){ bestF = d.fresh; best = d; }
+      }
+      if (best && !best.known){ best.known = true; best.fx = 1; }
+    }
+    if (best) primaryId = best.id;
+    for (const r of rivals) if (dist(r, player) < 1450) r.marked = 4;
+  }
+
+  for (let i = pulses.length - 1; i >= 0; i--){
+    const p = pulses[i];
+    p.r += 2300 * dt;
+    p.alpha = 1 - p.r / p.max;
+    if (p.r >= p.max) pulses.splice(i, 1);
+  }
+
+  for (let i = effects.length - 1; i >= 0; i--){
+    const e = effects[i];
+    e.r += (e.max / e.maxLife) * dt * 3;
+    e.life -= dt;
+    if (e.life <= 0) effects.splice(i, 1);
+  }
+
+  /* ---------- Drops decay ---------- */
+  const decayMul = (phase === 'UPDATE') ? (2.3 + cycleNum * 0.18) : 1;
+  for (const d of drops){
+    if (d.fx > 0) d.fx = Math.max(0, d.fx - dt * 1.4);
+    if (d.resolved) continue;
+    d.fresh -= d.decay * decayMul * dt;
+    if (d.fresh <= 0){
+      d.fresh = 0;
+      d.resolved = true;
+      d.lost = true;
+      stat.lost++;
+      message('CACHE LOST // DD-' + pad(d.id), '#ff3b30', 3.5);
+      beep(140, 0.5, 'sawtooth', 0.05, 60);
+      shake(6, 0.4);
+    }
+  }
+
+  if (primaryId != null){
+    const pd = drops.find(x => x.id === primaryId);
+    if (!pd || pd.resolved){
+      let best = null, bestF = -1;
+      for (const d of drops){
+        if (!d.resolved && d.known && d.fresh > bestF){ bestF = d.fresh; best = d; }
+      }
+      primaryId = best ? best.id : null;
+    }
+  }
+
+  /* ---------- Interaction ---------- */
+  updateInteraction(dt);
+
+  /* ---------- Rivals ---------- */
+  for (const r of rivals){
+    if (!r.alive) continue;
+    updateRival(r, dt);
+  }
+  rivals = rivals.filter(r => r.alive);
+
+  for (const r of rivals){
+    if (r.stunT > 0) continue;
+    if (dist(r, player) < r.r + player.r + 6){
+      player.hp -= 34 * dt;
+      player.hurtT = 0.25;
+      if (Math.random() < 0.4) shake(3, 0.15);
+      if (action.active){ action.progress = 0; action.active = false; }
+    }
+  }
+
+  let nearThreat = false;
+  for (const r of rivals){
+    if (r.stunT > 0) continue;
+    if (dist(r, player) < 340){ nearThreat = true; break; }
+  }
+  if (!nearThreat) player.hp = Math.min(player.maxHp, player.hp + 5 * dt);
+  player.hp = clamp(player.hp, 0, player.maxHp);
+  player.hurtT = Math.max(0, player.hurtT - dt);
+
+  /* ---------- Heat ---------- */
+  heat = clamp(heat - 4.5 * dt, 0, 100);
+  let seenBy = 0;
+  for (const r of rivals) if (r.state === 'alert' && r.stunT <= 0) seenBy++;
+  if (seenBy > 0) heat = clamp(heat + 7 * seenBy * dt, 0, 100);
+
+  /* ---------- Spawning ---------- */
+  spawnTimer -= dt;
+  if (spawnTimer <= 0){
+    spawnTimer = Math.max(1.4, 4.5 - cycleNum * 0.25);
+    spawnRival(true);
+  }
+
+  /* ---------- Particles ---------- */
+  for (let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.94; p.vy *= 0.94;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  /* ---------- Camera ---------- */
+  const tx = player.x - W/2, ty = player.y - H/2;
+  cam.x = lerp(cam.x, tx, 1 - Math.pow(0.0006, dt));
+  cam.y = lerp(cam.y, ty, 1 - Math.pow(0.0006, dt));
+  cam.x = clamp(cam.x, -40, WW - W + 40);
+  cam.y = clamp(cam.y, -40, WH - H + 40);
+
+  /* ---------- End conditions ---------- */
+  if (player.hp <= 0 && gameState === 'PLAY'){
+    gameState = 'FAIL';
+    endTimer = 0;
+    beep(90, 1.2, 'sawtooth', 0.08, 40);
+  }
+
+  if (gameState === 'PLAY' && drops.length && drops.every(d => d.resolved)){
+    if (phase !== 'END'){
+      phase = 'END';
+      gameState = 'END';
+      endTimer = 0;
+      persistent.score += stat.score;
+      beep(660, 0.2, 'square', 0.05);
+      setTimeout(() => beep(990, 0.3, 'square', 0.05), 160);
+      setTimeout(() => beep(1320, 0.4, 'square', 0.05), 320);
+    }
+  }
+}
+
+function fireWeapon(type){
+  const lvl = persistent.loot.weapons[type];
+  if (lvl <= 0) return;
+  if (player.weaponCd[type] > 0) return;
+
+  if (type === 'smg'){
+    const dmg = [0, 25, 40, 60][lvl];
+    const cd  = [0, 0.15, 0.12, 0.09][lvl];
+    const spd = 800;
+    const a = player.angle + rand(-0.03, 0.03);
+    bullets.push({
+      x: player.x + Math.cos(a) * 16,
+      y: player.y + Math.sin(a) * 16,
+      vx: Math.cos(a) * spd,
+      vy: Math.sin(a) * spd,
+      damage: dmg, life: 1.0
+    });
+    player.weaponCd.smg = cd;
+    beep(640, 0.04, 'square', 0.035);
+    for (let i = 0; i < 4; i++){
+      particles.push({
+        x: player.x + Math.cos(a)*18, y: player.y + Math.sin(a)*18,
+        vx: Math.cos(a)*rand(80,160) + rand(-40,40),
+        vy: Math.sin(a)*rand(80,160) + rand(-40,40),
+        life: 0.2, col: WEAPON_DEFS.smg.col
+      });
+    }
+  }
+  else if (type === 'taser'){
+    const radius = [0, 90, 130, 175][lvl];
+    const stun   = [0, 2.0, 3.0, 5.0][lvl];
+    const cd     = [0, 2.5, 2.0, 1.5][lvl];
+    for (const r of rivals){
+      if (dist(r, player) < radius + r.r){
+        r.stunT = Math.max(r.stunT, stun);
+        r.awareness = 0;
+        r.state = 'patrol';
+        for (let k = 0; k < 10; k++){
+          particles.push({ x:r.x, y:r.y, vx:rand(-80,80), vy:rand(-80,80), life:0.5, col:WEAPON_DEFS.taser.col });
+        }
+      }
+    }
+    effects.push({ x:player.x, y:player.y, r:0, max:radius, col:WEAPON_DEFS.taser.col, life:0.4, maxLife:0.4 });
+    player.weaponCd.taser = cd;
+    beep(220, 0.18, 'sawtooth', 0.05, 900);
+  }
+  else if (type === 'emp'){
+    const radius = [0, 200, 280, 370][lvl];
+    const stun   = [0, 3.0, 5.0, 8.0][lvl];
+    const cd     = [0, 9.0, 7.0, 5.0][lvl];
+    for (const r of rivals){
+      if (dist(r, player) < radius + r.r){
+        r.stunT = Math.max(r.stunT, stun);
+        r.awareness = 0;
+        r.state = 'patrol';
+        for (let k = 0; k < 12; k++){
+          particles.push({ x:r.x, y:r.y, vx:rand(-120,120), vy:rand(-120,120), life:0.6, col:WEAPON_DEFS.emp.col });
+        }
+      }
+    }
+    effects.push({ x:player.x, y:player.y, r:0, max:radius, col:WEAPON_DEFS.emp.col, life:0.7, maxLife:0.7 });
+    player.weaponCd.emp = cd;
+    beep(110, 0.4, 'sine', 0.06, 50);
+    shake(6, 0.3);
+  }
+}
+
+function shake(m, t){ shakeMag = Math.max(shakeMag, m); shakeT = Math.max(shakeT, t); }
+
+function resolveCollision(p, r){
+  const i0 = Math.floor((p.x - r) / CELL), i1 = Math.floor((p.x + r) / CELL);
+  const j0 = Math.floor((p.y - r) / CELL), j1 = Math.floor((p.y + r) / CELL);
+  for (let i = i0; i <= i1; i++){
+    if (i < 0 || i >= COLS) continue;
+    for (let j = j0; j <= j1; j++){
+      if (j < 0 || j >= ROWS) continue;
+      for (const b of cells[i][j].buildings){
+        const cx = clamp(p.x, b.x, b.x + b.w);
+        const cy = clamp(p.y, b.y, b.y + b.h);
+        const dx = p.x - cx, dy = p.y - cy;
+        const d2 = dx*dx + dy*dy;
+        if (d2 < r*r){
+          const d = Math.sqrt(d2);
+          if (d > 0.001){
+            p.x += dx / d * (r - d);
+            p.y += dy / d * (r - d);
+          } else {
+            const l = p.x - b.x, rr = b.x + b.w - p.x;
+            const tp = p.y - b.y, bo = b.y + b.h - p.y;
+            const mn = Math.min(l, rr, tp, bo);
+            if (mn === l) p.x = b.x - r;
+            else if (mn === rr) p.x = b.x + b.w + r;
+            else if (mn === tp) p.y = b.y - r;
+            else p.y = b.y + b.h + r;
+          }
+        }
+      }
+    }
+  }
+}
+
+/* ============================================================
+   INTERACTION
+   ============================================================ */
+function updateInteraction(dt){
+  const prevTarget = action.target;
+  let target = null;
+
+  if (phase === 'LOCATE'){
+    const p = drops.find(d => d.id === primaryId && !d.resolved);
+    if (p && dist(player, p) < 72) target = { type:'EXTRACT', obj:p, dur:3.2 };
+  } else if (phase === 'UPLOAD'){
+    let best = null, bd = 1e9;
+    for (const tm of terminals){
+      const d = dist(player, tm);
+      if (d < 85 && d < bd){ bd = d; best = tm; }
+    }
+    if (best) target = { type:'UPLOAD', obj:best, dur:4.0 };
+  } else if (phase === 'UPDATE'){
+    let best = null, bd = 1e9;
+    for (const d of drops){
+      if (d.resolved) continue;
+      const dd = dist(player, d);
+      if (dd < 72 && dd < bd){ bd = dd; best = d; }
+    }
+    if (best) target = { type:'UPDATE', obj:best, dur:2.0 };
+  }
+
+  if (!target){
+    if (action.active) action.progress = 0;
+    action.active = false; action.target = null; action.type = null;
+    return;
+  }
+
+  if (prevTarget !== target.obj){
+    action.progress = 0;
+    action.type = target.type;
+    action.target = target.obj;
+    action.duration = target.dur;
+  }
+  action.duration = target.dur;
+
+  if (keys['KeyE']){
+    action.active = true;
+    action.progress += dt;
+    if (Math.random() < 0.35){
+      particles.push({
+        x: player.x + rand(-10,10), y: player.y + rand(-10,10),
+        vx: rand(-30,30), vy: rand(-60,-20), life: 0.5, col: '#3df0ff'
+      });
+    }
+    if (action.progress >= action.duration){
+      completeAction(target);
+      action.progress = 0;
+      action.active = false;
+    }
+  } else {
+    action.active = false;
+    action.progress = Math.max(0, action.progress - dt * 1.6);
+  }
+}
+
+function completeAction(target){
+  if (target.type === 'EXTRACT'){
+    target.obj.resolved = true;
+    target.obj.updated = true;
+    target.obj.known = true;
+    stat.updated++;
+    stat.score += Math.round(target.obj.fresh);
+    phase = 'UPLOAD';
+    heat = Math.min(100, heat + 26);
+    message('CACHE EXTRACTED // SEEK SECURE TERMINAL', '#ff2d95', 5);
+    beep(520, 0.15, 'square', 0.06);
+    setTimeout(() => beep(780, 0.25, 'square', 0.06), 120);
+    shake(5, 0.35);
+    for (let i = 0; i < 26; i++){
+      particles.push({ x:target.obj.x, y:target.obj.y, vx:rand(-160,160), vy:rand(-160,160), life:rand(0.4,0.9), col:PRIMARY_COL });
+    }
+    rollLoot(target.obj.x, target.obj.y);
+  }
+  else if (target.type === 'UPLOAD'){
+    target.obj.used = true;
+    phase = 'UPDATE';
+    for (const d of drops) if (!d.resolved){ d.known = true; d.fx = 1; }
+    message('UPLINK COMPLETE // UPDATE ALL REMAINING DROPS', '#2bff88', 5.5);
+    message('DATA DECAY ACCELERATING', '#ff3b30', 5.5);
+    heat = Math.min(100, heat + 14);
+    beep(440, 0.2, 'sine', 0.06, 880);
+    setTimeout(() => beep(880, 0.4, 'sine', 0.06), 180);
+    shake(4, 0.3);
+  }
+  else if (target.type === 'UPDATE'){
+    target.obj.resolved = true;
+    target.obj.updated = true;
+    stat.updated++;
+    stat.score += Math.round(target.obj.fresh);
+    message('DD-' + pad(target.obj.id) + ' UPDATED // ' + Math.round(target.obj.fresh) + '%', '#2bff88', 2.5);
+    beep(700 + target.obj.id * 40, 0.12, 'square', 0.05);
+    for (let i = 0; i < 16; i++){
+      particles.push({ x:target.obj.x, y:target.obj.y, vx:rand(-120,120), vy:rand(-120,120), life:rand(0.3,0.7), col:TERM_COL });
+    }
+    rollLoot(target.obj.x, target.obj.y);
+  }
+}
+
+/* ============================================================
+   RIVALS
+   ============================================================ */
+function updateRival(r, dt){
+  r.marked = Math.max(0, r.marked - dt);
+
+  if (r.stunT > 0){
+    r.stunT -= dt;
+    r.awareness = 0;
+    r.state = 'patrol';
+    r.path = [];
+    return;
+  }
+
+  const d = dist(r, player);
+  const toPlayer = Math.atan2(player.y - r.y, player.x - r.x);
+  const face = angDiff(toPlayer, r.angle);
+
+  let vd = r.state === 'alert' ? 470 : 360;
+  if (player.crouch) vd *= 0.42 * crouchBonus().vis;
+  if (player.sprint) vd *= 1.18 * sprintBonus().vis;
+  if (solidAt(player.x, player.y)) vd *= 0.3;
+
+  const inCone = Math.abs(face) < r.fov / 2;
+  const canSee = d < vd && inCone && losClear(r, player);
+
+  if (canSee) r.awareness += dt * (1.9 + (r.state === 'alert' ? 1.2 : 0));
+  else r.awareness -= dt * 0.75;
+  r.awareness = clamp(r.awareness, 0, 1);
+
+  if (r.awareness >= 1 && r.state !== 'alert'){
+    r.state = 'alert';
+    message('DETECTED // UNIT ' + Math.floor(r.x/100) + '-' + Math.floor(r.y/100), '#ff3b30', 2.4);
+    beep(300, 0.18, 'square', 0.05, 900);
+    shake(3, 0.2);
+  }
+  if (r.state === 'alert'){
+    if (canSee){ r.lastKnown = { x: player.x, y: player.y }; r.loseT = 0; }
+    else { r.loseT += dt; if (r.loseT > 5.5){ r.state = 'search'; r.awareness = 0.4; r.loseT = 0; } }
+  }
+  if (r.state === 'search'){
+    if (canSee){ r.state = 'alert'; r.loseT = 0; }
+    else { r.loseT += dt; if (r.loseT > 6){ r.state = 'patrol'; r.loseT = 0; r.lastKnown = null; } }
+  }
+
+  let desiredAngle = r.angle;
+  if (r.state === 'alert' && r.lastKnown) desiredAngle = Math.atan2(r.lastKnown.y - r.y, r.lastKnown.x - r.x);
+  else if (r.path.length > 1){
+    const nxt = nodePos(r.path[1][0], r.path[1][1]);
+    desiredAngle = Math.atan2(nxt.y - r.y, nxt.x - r.x);
+  }
+  r.angle += angDiff(desiredAngle, r.angle) * Math.min(1, dt * 6);
+
+  let spd = r.state === 'alert' ? 208 : (r.state === 'search' ? 130 : 92);
+  let direct = r.state === 'alert' && d < 200 && losClear(r, player);
+
+  r.pathT -= dt;
+  if (r.pathT <= 0){
+    r.pathT = 0.45 + Math.random() * 0.3;
+    const me = nearestNode(r.x, r.y);
+    let goal;
+    if ((r.state === 'alert' || r.state === 'search') && r.lastKnown) goal = nearestNode(r.lastKnown.x, r.lastKnown.y);
+    else goal = { k: rndInt(0, COLS), m: rndInt(0, ROWS) };
+    r.path = bfsPath(me.k, me.m, goal.k, goal.m);
+    if (r.path.length < 2) r.path = [];
+  }
+
+  let moved = false;
+  if (direct){
+    const before = { x: r.x, y: r.y };
+    r.x += Math.cos(r.angle) * spd * dt;
+    r.y += Math.sin(r.angle) * spd * dt;
+    resolveCollision(r, r.r);
+    if (Math.hypot(r.x - before.x, r.y - before.y) > spd * dt * 0.4) moved = true;
+  }
+  if (!moved && r.path.length >= 2){
+    const nxt = nodePos(r.path[1][0], r.path[1][1]);
+    const dx = nxt.x - r.x, dy = nxt.y - r.y;
+    const dd = Math.hypot(dx, dy);
+    if (dd < 18) r.path.shift();
+    else { r.x += dx/dd * spd * dt; r.y += dy/dd * spd * dt; }
+    resolveCollision(r, r.r);
+  } else if (!moved && r.path.length < 2){
+    r.x += Math.cos(r.angle) * spd * dt;
+    r.y += Math.sin(r.angle) * spd * dt;
+    resolveCollision(r, r.r);
+  }
+
+  r.x = clamp(r.x, r.r, WW - r.r);
+  r.y = clamp(r.y, r.r, WH - r.r);
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function render(){
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#04050a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (gameState === 'TITLE'){ drawTitle(); return; }
+
+  let ox = 0, oy = 0;
+  if (shakeT > 0){
+    ox = rand(-shakeMag, shakeMag);
+    oy = rand(-shakeMag, shakeMag);
+    shakeMag *= 0.9;
+  }
+
+  ctx.save();
+  ctx.translate(-Math.round(cam.x) + ox, -Math.round(cam.y) + oy);
+
+  drawGround();
+  drawSubway();
+  drawCones();
+  drawBuildings();
+  drawTerminals();
+  drawDrops();
+  drawParticles();
+  drawBullets();
+  drawRivals();
+  drawPlayer();
+  drawPulses();
+  drawEffects();
+
+  ctx.restore();
+
+  drawVignette();
+  drawHUD();
+
+  if (gameState === 'END') drawEndScreen(true);
+  if (gameState === 'FAIL') drawEndScreen(false);
+}
+
+function drawGround(){
+  const i0 = Math.max(0, Math.floor(cam.x / CELL) - 1);
+  const i1 = Math.min(COLS - 1, Math.floor((cam.x + W) / CELL) + 1);
+  const j0 = Math.max(0, Math.floor(cam.y / CELL) - 1);
+  const j1 = Math.min(ROWS - 1, Math.floor((cam.y + H) / CELL) + 1);
+
+  ctx.fillStyle = '#0b0e14';
+  ctx.fillRect(cam.x - 10, cam.y - 10, W + 20, H + 20);
+
+  for (let i = i0; i <= i1; i++){
+    for (let j = j0; j <= j1; j++){
+      const D = DISTRICTS[cells[i][j].d];
+      const x0 = i*CELL + ROAD, y0 = j*CELL + ROAD;
+      const bw = CELL - 2*ROAD, bh = CELL - 2*ROAD;
+      ctx.fillStyle = D.ground;
+      ctx.fillRect(x0, y0, bw, bh);
+      ctx.strokeStyle = D.edge;
+      ctx.globalAlpha = 0.08;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  ctx.save();
+  ctx.globalAlpha = 0.16;
+  ctx.strokeStyle = '#3df0ff';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([18, 22]);
+  ctx.beginPath();
+  for (let i = Math.max(0, i0); i <= Math.min(COLS, i1 + 1); i++){
+    ctx.moveTo(i*CELL + 0.5, cam.y - 20);
+    ctx.lineTo(i*CELL + 0.5, cam.y + H + 20);
+  }
+  for (let j = Math.max(0, j0); j <= Math.min(ROWS, j1 + 1); j++){
+    ctx.moveTo(cam.x - 20, j*CELL + 0.5);
+    ctx.lineTo(cam.x + W + 20, j*CELL + 0.5);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawSubway(){
+  if (!subway) return;
+
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 500);
+
+  // Track segments (zigzag)
+  for (const seg of subway.segments){
+    // Outer glow
+    ctx.strokeStyle = SUBWAY_COL;
+    ctx.globalAlpha = 0.08 + pulse * 0.05;
+    ctx.lineWidth = 14;
+    ctx.beginPath();
+    ctx.moveTo(seg.a.x, seg.a.y);
+    ctx.lineTo(seg.b.x, seg.b.y);
+    ctx.stroke();
+
+    // Inner track
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = SUBWAY_COL;
+    ctx.beginPath();
+    ctx.moveTo(seg.a.x, seg.a.y);
+    ctx.lineTo(seg.b.x, seg.b.y);
+    ctx.stroke();
+
+    // Dashed center line
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([10, 10]);
+    ctx.strokeStyle = '#d9b4ff';
+    ctx.beginPath();
+    ctx.moveTo(seg.a.x, seg.a.y);
+    ctx.lineTo(seg.b.x, seg.b.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  // Stations
+  for (let i = 0; i < subway.stops.length; i++){
+    const s = subway.stops[i];
+    const here = subwayStationAt(player.x, player.y) === i;
+
+    // Platform glow
+    const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, 90);
+    g.addColorStop(0, here ? 'rgba(184,115,255,0.35)' : 'rgba(184,115,255,0.15)');
+    g.addColorStop(1, 'rgba(184,115,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 90, 0, TAU); ctx.fill();
+
+    // Station square
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(performance.now() / 2000);
+    ctx.strokeStyle = SUBWAY_COL;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    for (let k = 0; k < 4; k++){
+      const a = k * TAU / 4;
+      ctx.moveTo(Math.cos(a) * 26, Math.sin(a) * 26);
+      ctx.arc(0, 0, 26, a, a + 0.6);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = here ? '#fff' : SUBWAY_COL;
+    ctx.font = 'bold 11px ui-monospace,monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('STATION ' + (i + 1), s.x, s.y - 36);
+    ctx.font = '10px ui-monospace,monospace';
+    ctx.fillStyle = here ? '#d9b4ff' : 'rgba(184,115,255,0.7)';
+    ctx.fillText(here ? '◆ YOU ARE HERE ◆' : (10 * Math.abs(i - subwayStationAt(player.x, player.y))) + ' OPIUM', s.x, s.y + 46);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawCones(){
+  for (const r of rivals){
+    if (r.stunT > 0) continue;
+    if (dist(r, player) > 1300) continue;
+    let vd = r.state === 'alert' ? 470 : 360;
+    const alert = r.state === 'alert';
+    ctx.beginPath();
+    ctx.moveTo(r.x, r.y);
+    ctx.arc(r.x, r.y, vd, r.angle - r.fov/2, r.angle + r.fov/2);
+    ctx.closePath();
+    const g = ctx.createRadialGradient(r.x, r.y, 0, r.x, r.y, vd);
+    if (alert){
+      g.addColorStop(0, 'rgba(255,59,48,0.20)');
+      g.addColorStop(1, 'rgba(255,59,48,0.0)');
+    } else {
+      g.addColorStop(0, 'rgba(255,150,60,0.12)');
+      g.addColorStop(1, 'rgba(255,150,60,0.0)');
+    }
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+}
+
+function drawBuildings(){
+  const i0 = Math.max(0, Math.floor(cam.x / CELL) - 1);
+  const i1 = Math.min(COLS - 1, Math.floor((cam.x + W) / CELL) + 1);
+  const j0 = Math.max(0, Math.floor(cam.y / CELL) - 1);
+  const j1 = Math.min(ROWS - 1, Math.floor((cam.y + H) / CELL) + 1);
+
+  for (let i = i0; i <= i1; i++){
+    for (let j = j0; j <= j1; j++){
+      const D = DISTRICTS[cells[i][j].d];
+      for (const b of cells[i][j].buildings){
+        ctx.fillStyle = '#060810';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(b.x + 3, b.y + 3, b.w - 6, b.h - 6);
+        ctx.strokeStyle = D.edge;
+        ctx.globalAlpha = D.a;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(b.x + 0.75, b.y + 0.75, b.w - 1.5, b.h - 1.5);
+        ctx.globalAlpha = 0.9;
+        ctx.lineWidth = 2;
+        const cl = Math.min(10, b.w * 0.25, b.h * 0.25);
+        ctx.beginPath();
+        ctx.moveTo(b.x, b.y + cl); ctx.lineTo(b.x, b.y); ctx.lineTo(b.x + cl, b.y);
+        ctx.moveTo(b.x + b.w - cl, b.y); ctx.lineTo(b.x + b.w, b.y); ctx.lineTo(b.x + b.w, b.y + cl);
+        ctx.moveTo(b.x + b.w, b.y + b.h - cl); ctx.lineTo(b.x + b.w, b.y + b.h); ctx.lineTo(b.x + b.w - cl, b.y + b.h);
+        ctx.moveTo(b.x + cl, b.y + b.h); ctx.lineTo(b.x, b.y + b.h); ctx.lineTo(b.x, b.y + b.h - cl);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+}
+
+function drawTerminals(){
+  const t = performance.now() / 1000;
+  for (const tm of terminals){
+    if (Math.abs(tm.x - player.x) > W/2 + 200 || Math.abs(tm.y - player.y) > H/2 + 200) continue;
+    const active = (phase === 'UPLOAD');
+    const pulse = 0.5 + 0.5 * Math.sin(t * 3 + tm.pulse);
+    const R = 22;
+
+    ctx.save();
+    ctx.translate(tm.x, tm.y);
+    if (active){
+      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 120);
+      g.addColorStop(0, 'rgba(43,255,136,' + (0.22 + pulse * 0.16) + ')');
+      g.addColorStop(1, 'rgba(43,255,136,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0, 0, 120, 0, TAU); ctx.fill();
+    }
+    ctx.rotate(t * (active ? 0.9 : 0.3));
+    ctx.strokeStyle = active ? TERM_COL : 'rgba(43,255,136,0.35)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 4; i++){
+      const a = i * TAU / 4;
+      ctx.moveTo(Math.cos(a) * R, Math.sin(a) * R);
+      ctx.arc(0, 0, R, a, a + 0.5);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(tm.x, tm.y);
+    ctx.fillStyle = active ? TERM_COL : 'rgba(43,255,136,0.4)';
+    ctx.fillRect(-7, -7, 14, 14);
+    ctx.fillStyle = '#04050a';
+    ctx.fillRect(-3, -3, 6, 6);
+    ctx.restore();
+
+    if (active){
+      ctx.fillStyle = TERM_COL;
+      ctx.font = '11px ui-monospace,monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('SECURE TERMINAL', tm.x, tm.y - 34);
+      ctx.textAlign = 'left';
+    }
+  }
+}
+
+function drawDrops(){
+  const t = performance.now() / 1000;
+  for (const d of drops){
+    if (!d.known) continue;
+    if (Math.abs(d.x - player.x) > W/2 + 200 || Math.abs(d.y - player.y) > H/2 + 200) continue;
+
+    const isPrimary = (d.id === primaryId) && phase === 'LOCATE' && !d.resolved;
+    const col = d.resolved ? (d.updated ? 'rgba(43,255,136,0.35)' : 'rgba(255,59,48,0.35)')
+                           : (isPrimary ? PRIMARY_COL : DROP_COL);
+    const pulse = 0.5 + 0.5 * Math.sin(t * 4 + d.pulseOff);
+    const R = d.resolved ? 6 : 9 + pulse * 2;
+
+    if (!d.resolved){
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = 0.22 * (1 - pulse) + 0.05;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, 16 + pulse * 22, 0, TAU);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      const g = ctx.createRadialGradient(d.x, d.y, 0, d.x, d.y, 60);
+      g.addColorStop(0, isPrimary ? 'rgba(255,45,149,0.28)' : 'rgba(255,210,63,0.16)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(d.x, d.y, 60, 0, TAU); ctx.fill();
+    }
+
+    ctx.save();
+    ctx.translate(d.x, d.y);
+    ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = col;
+    ctx.fillRect(-R/2, -R/2, R, R);
+    ctx.restore();
+
+    if (!d.resolved){
+      const bw = 46, bh = 5;
+      const bx = d.x - bw/2, by = d.y - 30;
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+      const f = d.fresh / 100;
+      ctx.fillStyle = f > 0.55 ? '#2bff88' : f > 0.25 ? '#ffd23f' : '#ff3b30';
+      ctx.fillRect(bx, by, bw * f, bh);
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx - 0.5, by - 0.5, bw + 1, bh + 1);
+      ctx.fillStyle = isPrimary ? PRIMARY_COL : '#9fb6cc';
+      ctx.font = '10px ui-monospace,monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText((isPrimary ? '★ ' : '') + 'DD-' + pad(d.id) + '  ' + Math.round(d.fresh) + '%', d.x, d.y - 36);
+      ctx.textAlign = 'left';
+    } else {
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      if (d.updated){
+        ctx.moveTo(d.x - 5, d.y); ctx.lineTo(d.x - 1, d.y + 4); ctx.lineTo(d.x + 6, d.y - 5);
+      } else {
+        ctx.moveTo(d.x - 5, d.y - 5); ctx.lineTo(d.x + 5, d.y + 5);
+        ctx.moveTo(d.x + 5, d.y - 5); ctx.lineTo(d.x - 5, d.y + 5);
+      }
+      ctx.stroke();
+    }
+  }
+}
+
+function drawRivals(){
+  for (const r of rivals){
+    if (Math.abs(r.x - player.x) > W/2 + 200 || Math.abs(r.y - player.y) > H/2 + 200) continue;
+    const stunned = r.stunT > 0;
+    const alert = r.state === 'alert' && !stunned;
+    const search = r.state === 'search' && !stunned;
+    const col = stunned ? '#3df0ff' : alert ? '#ff3b30' : search ? '#ff9d2b' : '#c94b3a';
+
+    if (r.awareness > 0.02 && r.awareness < 1 && !stunned){
+      ctx.strokeStyle = '#ffd23f';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, 22, -Math.PI/2, -Math.PI/2 + TAU * r.awareness);
+      ctx.stroke();
+    }
+
+    if (alert){
+      const g = ctx.createRadialGradient(r.x, r.y, 0, r.x, r.y, 50);
+      g.addColorStop(0, 'rgba(255,59,48,0.4)');
+      g.addColorStop(1, 'rgba(255,59,48,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(r.x, r.y, 50, 0, TAU); ctx.fill();
+    }
+
+    ctx.save();
+    ctx.translate(r.x, r.y);
+    ctx.rotate(r.angle);
+    ctx.fillStyle = '#0a0a0f';
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(11, 0); ctx.lineTo(-7, -8); ctx.lineTo(-4, 0); ctx.lineTo(-7, 8);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    if (r.hp < r.maxHp){
+      const bw = 26, bh = 3;
+      const bx = r.x - bw/2, by = r.y - 22;
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+      ctx.fillStyle = '#ff3b30';
+      ctx.fillRect(bx, by, bw * (r.hp / r.maxHp), bh);
+    }
+
+    if (stunned){
+      ctx.fillStyle = '#3df0ff';
+      ctx.font = 'bold 11px ui-monospace,monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('✦', r.x, r.y - 26);
+      ctx.textAlign = 'left';
+    }
+
+    if (r.marked > 0){
+      ctx.strokeStyle = '#3df0ff';
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, 18, 0, TAU);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawPlayer(){
+  const t = performance.now() / 1000;
+  const p = player;
+
+  const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 90);
+  if (p.hurtT > 0) g.addColorStop(0, 'rgba(255,59,48,0.5)');
+  else g.addColorStop(0, 'rgba(61,240,255,0.22)');
+  g.addColorStop(1, 'rgba(61,240,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(p.x, p.y, 90, 0, TAU); ctx.fill();
+
+  if (p.crouch){
+    ctx.strokeStyle = 'rgba(61,240,255,0.35)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 6]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 24, 0, TAU); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (mouse.x > 0 || mouse.y > 0){
+    ctx.strokeStyle = 'rgba(61,240,255,0.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(mouse.wx, mouse.wy);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.angle);
+  ctx.fillStyle = p.hurtT > 0 ? '#ff3b30' : '#0a1418';
+  ctx.strokeStyle = p.hurtT > 0 ? '#ff3b30' : PLAYER_COL;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(14, 0); ctx.lineTo(-8, -9); ctx.lineTo(-4, 0); ctx.lineTo(-8, 9);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = PLAYER_COL;
+  ctx.beginPath(); ctx.arc(0, 0, 3, 0, TAU); ctx.fill();
+  ctx.restore();
+
+  if (player.activeWeapon){
+    const k = player.activeWeapon;
+    const maxCd = k === 'smg' ? 0.15 : k === 'taser' ? 2.5 : 9;
+    const cd = player.weaponCd[k];
+    if (cd > 0){
+      ctx.strokeStyle = WEAPON_DEFS[k].col;
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 20, -Math.PI/2, -Math.PI/2 + TAU * (1 - cd / maxCd));
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  if (phase === 'UPLOAD'){
+    const bob = Math.sin(t * 6) * 3;
+    ctx.strokeStyle = PRIMARY_COL;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y - 26 + bob, 6, 0, TAU);
+    ctx.stroke();
+    ctx.fillStyle = PRIMARY_COL;
+    ctx.beginPath(); ctx.arc(p.x, p.y - 26 + bob, 2.5, 0, TAU); ctx.fill();
+  }
+}
+
+function drawBullets(){
+  for (const b of bullets){
+    const spd = Math.hypot(b.vx, b.vy);
+    const dx = b.vx / spd, dy = b.vy / spd;
+    ctx.strokeStyle = WEAPON_DEFS.smg.col;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(b.x - dx * 12, b.y - dy * 12);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(b.x - 1.5, b.y - 1.5, 3, 3);
+  }
+}
+
+function drawPulses(){
+  for (const p of pulses){
+    ctx.strokeStyle = '#3df0ff';
+    ctx.globalAlpha = p.alpha * 0.85;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = p.alpha * 0.35;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.86, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawEffects(){
+  for (const e of effects){
+    const a = clamp(e.life / e.maxLife, 0, 1);
+    ctx.strokeStyle = e.col;
+    ctx.globalAlpha = a;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = a * 0.4;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r * 0.8, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawParticles(){
+  for (const p of particles){
+    ctx.globalAlpha = clamp(p.life * 2, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawVignette(){
+  const g = ctx.createRadialGradient(W/2, H/2, Math.min(W,H)*0.25, W/2, H/2, Math.max(W,H)*0.72);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.78)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.globalAlpha = 0.035;
+  ctx.fillStyle = '#000';
+  for (let y = 0; y < H; y += 3) ctx.fillRect(0, y, W, 1);
+  ctx.globalAlpha = 1;
+}
+
+/* ============================================================
+   HUD
+   ============================================================ */
+function drawHUD(){
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  const PAD = 18;
+
+  /* ---- Top-left: phase + objective ---- */
+  ctx.fillStyle = 'rgba(4,6,12,0.78)';
+  ctx.fillRect(PAD - 8, PAD - 8, 380, 92);
+  ctx.strokeStyle = 'rgba(61,240,255,0.28)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(PAD - 8 + 0.5, PAD - 8 + 0.5, 380, 92);
+
+  const phaseNames = { LOCATE: 'PHASE 01 // LOCATE', UPLOAD: 'PHASE 02 // UPLOAD', UPDATE: 'PHASE 03 // UPDATE', END: 'COMPLETE' };
+  const phaseCols  = { LOCATE: '#ffd23f', UPLOAD: '#ff2d95', UPDATE: '#2bff88', END: '#3df0ff' };
+  ctx.fillStyle = phaseCols[phase] || '#fff';
+  ctx.font = 'bold 15px ui-monospace,monospace';
+  ctx.fillText(phaseNames[phase] || '', PAD, PAD + 12);
+
+  ctx.fillStyle = '#9fb6cc';
+  ctx.font = '12px ui-monospace,monospace';
+  let obj = '';
+  if (phase === 'LOCATE'){
+    const p = drops.find(d => d.id === primaryId && !d.resolved);
+    obj = p ? ('PRIMARY: DD-' + pad(p.id) + '  ' + Math.round(p.fresh) + '%  [' + Math.round(dist(player, p)) + 'm]')
+            : 'NO PRIMARY — SCAN [SPACE]';
+  } else if (phase === 'UPLOAD'){
+    let nd = 1e9, nt = null;
+    for (const t of terminals){ const dd = dist(player, t); if (dd < nd){ nd = dd; nt = t; } }
+    obj = nt ? ('NEAREST TERMINAL: ' + Math.round(nd) + 'm') : 'FIND SECURE TERMINAL';
+  } else if (phase === 'UPDATE'){
+    const rem = drops.filter(d => !d.resolved).length;
+    obj = 'DROPS REMAINING: ' + rem;
+  }
+  ctx.fillText(obj, PAD, PAD + 34);
+
+  ctx.fillStyle = 'rgba(159,182,204,0.55)';
+  ctx.font = '11px ui-monospace,monospace';
+  ctx.fillText('WASD · SHIFT SPRINT · C CROUCH · E ACT · SPACE SCAN', PAD, PAD + 56);
+  ctx.fillText('1/2/3 WEAPON · LMB FIRE · Q/F/G SPIDERPHONE · H SUBWAY', PAD, PAD + 72);
+
+  /* ---- Loot bag panel ---- */
+  drawLootBag(PAD, PAD + 100);
+
+  /* ---- Top-right: vitals + credits ---- */
+  const rw = 260;
+  const rx = W - rw - PAD;
+  ctx.fillStyle = 'rgba(4,6,12,0.78)';
+  ctx.fillRect(rx, PAD - 8, rw, 128);
+  ctx.strokeStyle = 'rgba(61,240,255,0.28)';
+  ctx.strokeRect(rx + 0.5, PAD - 8 + 0.5, rw, 128);
+
+  ctx.fillStyle = '#9fb6cc';
+  ctx.font = '11px ui-monospace,monospace';
+  ctx.fillText('INTEGRITY', rx + 12, PAD + 12);
+  const hbw = rw - 24;
+  ctx.fillStyle = '#12161f';
+  ctx.fillRect(rx + 12, PAD + 18, hbw, 10);
+  const hf = player.hp / player.maxHp;
+  ctx.fillStyle = hf > 0.55 ? '#2bff88' : hf > 0.28 ? '#ffd23f' : '#ff3b30';
+  ctx.fillRect(rx + 12, PAD + 18, hbw * hf, 10);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.strokeRect(rx + 12.5, PAD + 18.5, hbw - 1, 9);
+
+  ctx.fillStyle = '#9fb6cc';
+  ctx.fillText('HEAT', rx + 12, PAD + 46);
+  ctx.fillStyle = '#12161f';
+  ctx.fillRect(rx + 12, PAD + 52, hbw, 10);
+  ctx.fillStyle = heat > 70 ? '#ff3b30' : heat > 40 ? '#ff9d2b' : '#3df0ff';
+  ctx.fillRect(rx + 12, PAD + 52, hbw * (heat / 100), 10);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.strokeRect(rx + 12.5, PAD + 52.5, hbw - 1, 9);
+
+  // Opium Lots (credits) — finance
+  ctx.fillStyle = SUBWAY_COL;
+  ctx.font = 'bold 13px ui-monospace,monospace';
+  ctx.fillText('◈ ' + persistent.credits + ' OPIUM LOTS', rx + 12, PAD + 80);
+
+  ctx.fillStyle = 'rgba(159,182,204,0.7)';
+  ctx.font = '11px ui-monospace,monospace';
+  ctx.fillText('CYCLE ' + (cycleNum + 1), rx + 12, PAD + 100);
+  ctx.fillStyle = '#3df0ff';
+  ctx.font = 'bold 14px ui-monospace,monospace';
+  ctx.fillText('TOTAL ' + persistent.score, rx + 12, PAD + 118);
+  ctx.fillStyle = 'rgba(159,182,204,0.6)';
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('MISSION +' + stat.score, rx + 130, PAD + 118);
+
+  /* ---- Scan cooldown ---- */
+  const sx = PAD, sy = H - 76;
+  ctx.fillStyle = 'rgba(4,6,12,0.78)';
+  ctx.fillRect(sx - 8, sy - 8, 220, 52);
+  ctx.strokeStyle = 'rgba(61,240,255,0.28)';
+  ctx.strokeRect(sx - 8 + 0.5, sy - 8 + 0.5, 220, 52);
+  ctx.fillStyle = scanCd > 0 ? '#5a6b7c' : '#3df0ff';
+  ctx.font = 'bold 12px ui-monospace,monospace';
+  ctx.fillText(scanCd > 0 ? 'SCAN RECHARGING' : 'SCAN READY [SPACE]', sx + 4, sy + 10);
+  ctx.fillStyle = '#12161f';
+  ctx.fillRect(sx + 4, sy + 18, 196, 6);
+  ctx.fillStyle = '#3df0ff';
+  ctx.fillRect(sx + 4, sy + 18, 196 * (1 - scanCd / 2.6), 6);
+
+  /* ---- Weapon bar ---- */
+  drawWeaponBar(PAD, H - 200);
+
+  /* ---- Subway panel (below weapon bar) ---- */
+  drawSubwayPanel(PAD, H - 320);
+
+  /* ---- Minimap ---- */
+  drawMinimap();
+
+  /* ---- Interaction prompt ---- */
+  if (action.target && !action.active){
+    const labels = { EXTRACT: 'HOLD [E] TO EXTRACT CACHE', UPLOAD: 'HOLD [E] TO UPLOAD', UPDATE: 'HOLD [E] TO UPDATE DROP' };
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 14px ui-monospace,monospace';
+    const txt = labels[action.type] || '';
+    const tw = ctx.measureText(txt).width;
+    ctx.fillStyle = 'rgba(4,6,12,0.85)';
+    ctx.fillRect(W/2 - tw/2 - 16, H - 148, tw + 32, 34);
+    ctx.strokeStyle = action.type === 'EXTRACT' ? PRIMARY_COL : action.type === 'UPLOAD' ? TERM_COL : '#ffd23f';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(W/2 - tw/2 - 16 + 0.5, H - 148 + 0.5, tw + 32, 34);
+    ctx.fillStyle = action.type === 'EXTRACT' ? PRIMARY_COL : action.type === 'UPLOAD' ? TERM_COL : '#ffd23f';
+    ctx.fillText(txt, W/2, H - 126);
+    ctx.textAlign = 'left';
+  }
+
+  if (action.active && action.duration > 0){
+    const bw = 260, bx = W/2 - bw/2, by = H - 130;
+    ctx.fillStyle = 'rgba(4,6,12,0.9)';
+    ctx.fillRect(bx - 3, by - 3, bw + 6, 20);
+    ctx.fillStyle = '#12161f';
+    ctx.fillRect(bx, by, bw, 14);
+    const f = clamp(action.progress / action.duration, 0, 1);
+    ctx.fillStyle = action.type === 'EXTRACT' ? PRIMARY_COL : action.type === 'UPLOAD' ? TERM_COL : '#ffd23f';
+    ctx.fillRect(bx, by, bw * f, 14);
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, 13);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#04050a';
+    ctx.font = 'bold 11px ui-monospace,monospace';
+    ctx.fillText(Math.round(f * 100) + '%', W/2, by + 11);
+    ctx.textAlign = 'left';
+  }
+
+  /* ---- Messages ---- */
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 14px ui-monospace,monospace';
+  let msgY = 130;
+  for (let i = messages.length - 1; i >= 0; i--){
+    const m = messages[i];
+    const a = m.t < 0.3 ? m.t / 0.3 : (m.t > m.dur - 0.6 ? (m.dur - m.t) / 0.6 : 1);
+    ctx.globalAlpha = clamp(a, 0, 1);
+    const tw = ctx.measureText(m.text).width;
+    ctx.fillStyle = 'rgba(4,6,12,0.7)';
+    ctx.fillRect(W/2 - tw/2 - 12, msgY - 16, tw + 24, 24);
+    ctx.fillStyle = m.col;
+    ctx.fillText(m.text, W/2, msgY);
+    ctx.globalAlpha = 1;
+    msgY -= 30;
+  }
+  ctx.textAlign = 'left';
+
+  if (player.hurtT > 0){
+    ctx.fillStyle = 'rgba(255,59,48,' + (player.hurtT * 0.5) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawLootBag(x, y){
+  const w = 260, h = 230;
+  ctx.fillStyle = 'rgba(4,6,12,0.78)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(61,240,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+
+  ctx.fillStyle = '#3df0ff';
+  ctx.font = 'bold 12px ui-monospace,monospace';
+  ctx.fillText('LOOT BAG', x + 12, y + 18);
+
+  let cy = y + 36;
+  ctx.fillStyle = 'rgba(159,182,204,0.6)';
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('WEAPONS', x + 12, cy);
+  cy += 14;
+  for (const k of WEAPON_ORDER){
+    const d = WEAPON_DEFS[k];
+    const lvl = persistent.loot.weapons[k];
+    const active = player.activeWeapon === k;
+    ctx.fillStyle = active ? d.col : (lvl > 0 ? '#cfe9ff' : '#5a6b7c');
+    ctx.font = (active ? 'bold ' : '') + '11px ui-monospace,monospace';
+    ctx.fillText((active ? '▶ ' : '  ') + d.name, x + 12, cy);
+    for (let i = 0; i < MAX_WEAPON_LVL; i++){
+      const bx = x + 180 + i * 14;
+      ctx.fillStyle = i < lvl ? d.col : 'rgba(90,107,124,0.4)';
+      ctx.fillRect(bx, cy - 8, 10, 8);
+    }
+    cy += 14;
+  }
+
+  cy += 4;
+  ctx.fillStyle = 'rgba(159,182,204,0.6)';
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('TRANSPORT', x + 12, cy);
+  cy += 14;
+  for (const k of ['runner', 'sprinter', 'ghost']){
+    const d = TRANSPORT_DEFS[k];
+    const lvl = persistent.loot.transport[k];
+    ctx.fillStyle = lvl > 0 ? '#cfe9ff' : '#5a6b7c';
+    ctx.font = '11px ui-monospace,monospace';
+    ctx.fillText('  ' + d.name, x + 12, cy);
+    for (let i = 0; i < MAX_TRANSPORT_LVL; i++){
+      const bx = x + 180 + i * 14;
+      ctx.fillStyle = i < lvl ? d.col : 'rgba(90,107,124,0.4)';
+      ctx.fillRect(bx, cy - 8, 10, 8);
+    }
+    cy += 14;
+  }
+
+  cy += 4;
+  ctx.fillStyle = 'rgba(159,182,204,0.6)';
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('COMMS', x + 12, cy);
+  cy += 14;
+  for (const k of ['reset', 'spawn', 'remote']){
+    const d = COMM_DEFS[k];
+    const n = persistent.loot.comms[k];
+    ctx.fillStyle = n > 0 ? d.col : '#5a6b7c';
+    ctx.font = '11px ui-monospace,monospace';
+    const label = '[' + d.key + '] ' + k.toUpperCase();
+    ctx.fillText(label, x + 12, cy);
+    ctx.textAlign = 'right';
+    ctx.fillText('×' + n, x + w - 12, cy);
+    ctx.textAlign = 'left';
+    cy += 14;
+  }
+
+  cy += 4;
+  ctx.fillStyle = 'rgba(159,182,204,0.6)';
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('FINANCE', x + 12, cy);
+  cy += 16;
+  ctx.fillStyle = SUBWAY_COL;
+  ctx.font = 'bold 13px ui-monospace,monospace';
+  ctx.fillText('◈ OPIUM LOTS', x + 12, cy);
+  ctx.textAlign = 'right';
+  ctx.fillText('' + persistent.credits, x + w - 12, cy);
+  ctx.textAlign = 'left';
+}
+
+function drawWeaponBar(x, y){
+  const w = 220, h = 80;
+  ctx.fillStyle = 'rgba(4,6,12,0.78)';
+  ctx.fillRect(x - 8, y - 8, w, h);
+  ctx.strokeStyle = 'rgba(61,240,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x - 8 + 0.5, y - 8 + 0.5, w, h);
+
+  ctx.fillStyle = 'rgba(159,182,204,0.6)';
+  ctx.font = '10px ui-monospace,monospace';
+  ctx.fillText('WEAPONS', x, y + 4);
+
+  let cy = y + 20;
+  for (let i = 0; i < WEAPON_ORDER.length; i++){
+    const k = WEAPON_ORDER[i];
+    const d = WEAPON_DEFS[k];
+    const lvl = persistent.loot.weapons[k];
+    const active = player.activeWeapon === k;
+    const locked = lvl <= 0;
+
+    ctx.fillStyle = active ? d.col : locked ? '#5a6b7c' : '#cfe9ff';
+    ctx.font = (active ? 'bold ' : '') + '11px ui-monospace,monospace';
+    ctx.fillText('[' + (i+1) + '] ' + d.name, x, cy);
+
+    ctx.textAlign = 'right';
+    if (locked){
+      ctx.fillStyle = '#5a6b7c';
+      ctx.fillText('LOCKED', x + w - 20, cy);
+    } else {
+      ctx.fillStyle = d.col;
+      ctx.fillText('L' + lvl, x + w - 20, cy);
+    }
+    ctx.textAlign = 'left';
+
+    if (active){
+      ctx.fillStyle = d.col;
+      ctx.fillRect(x - 4, cy - 9, 2, 10);
+    }
+    cy += 16;
+  }
+}
+
+function drawSubwayPanel(x, y){
+  const w = 220, h = 90;
+  ctx.fillStyle = 'rgba(4,6,12,0.78)';
+  ctx.fillRect(x - 8, y - 8, w, h);
+  ctx.strokeStyle = 'rgba(184,115,255,0.35)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x - 8 + 0.5, y - 8 + 0.5, w, h);
+
+  ctx.fillStyle = SUBWAY_COL;
+  ctx.font = 'bold 11px ui-monospace,monospace';
+  ctx.fillText('◈ SUBWAY LINE', x, y + 4);
+
+  const here = subwayStationAt(player.x, player.y);
+
+  let cy = y + 22;
+  for (let i = 0; i < subway.stops.length; i++){
+    const s = subway.stops[i];
+    const active = here === i;
+    const cost = here >= 0 ? (Math.abs(i - here) * SUBWAY_COST_PER_STOP) : 0;
+
+    ctx.fillStyle = active ? '#fff' : (here >= 0 ? 'rgba(217,180,255,0.85)' : 'rgba(159,182,204,0.55)');
+    ctx.font = (active ? 'bold ' : '') + '11px ui-monospace,monospace';
+    ctx.fillText((active ? '▶ ' : '  ') + 'STATION ' + (i+1), x, cy);
+
+    ctx.textAlign = 'right';
+    if (active){
+      ctx.fillStyle = '#fff';
+      ctx.fillText('HERE', x + w - 20, cy);
+    } else if (here >= 0){
+      ctx.fillStyle = persistent.credits >= cost ? SUBWAY_COL : '#5a6b7c';
+      ctx.fillText(cost + ' ◈', x + w - 20, cy);
+    } else {
+      ctx.fillStyle = 'rgba(159,182,204,0.35)';
+      ctx.fillText('—', x + w - 20, cy);
+    }
+    ctx.textAlign = 'left';
+    cy += 14;
+  }
+
+  cy += 2;
+  if (here >= 0 && !subwayRide){
+    ctx.fillStyle = SUBWAY_COL;
+    ctx.font = 'bold 11px ui-monospace,monospace';
+    ctx.fillText('[H] RIDE TO NEXT STATION', x, cy);
+  } else if (subwayRide){
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px ui-monospace,monospace';
+    ctx.fillText('▶ IN TRANSIT…', x, cy);
+  } else {
+    ctx.fillStyle = 'rgba(159,182,204,0.45)';
+    ctx.font = '11px ui-monospace,monospace';
+    ctx.fillText('FIND A STATION', x, cy);
+  }
+}
+
+function drawMinimap(){
+  const mw = 180, mh = 135;
+  const mx = W - mw - 18, my = H - mh - 18;
+  const sc = mw / WW;
+
+  ctx.fillStyle = 'rgba(4,6,12,0.8)';
+  ctx.fillRect(mx - 4, my - 4, mw + 8, mh + 8);
+  ctx.strokeStyle = 'rgba(61,240,255,0.3)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(mx - 4.5, my - 4.5, mw + 8, mh + 8);
+
+  for (let i = 0; i < COLS; i++){
+    const d = districtAt(i);
+    ctx.fillStyle = DISTRICTS[d].ground;
+    ctx.globalAlpha = 0.9;
+    ctx.fillRect(mx + i*CELL*sc, my, CELL*sc + 0.5, mh);
+    ctx.globalAlpha = 1;
+  }
+
+  // Subway line
+  if (subway){
+    ctx.strokeStyle = SUBWAY_COL;
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < subway.segments.length; i++){
+      const seg = subway.segments[i];
+      ctx.moveTo(mx + seg.a.x*sc, my + seg.a.y*sc);
+      ctx.lineTo(mx + seg.b.x*sc, my + seg.b.y*sc);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    for (const s of subway.stops){
+      ctx.fillStyle = SUBWAY_COL;
+      ctx.fillRect(mx + s.x*sc - 2.5, my + s.y*sc - 2.5, 5, 5);
+    }
+  }
+
+  ctx.strokeStyle = 'rgba(61,240,255,0.12)';
+  ctx.beginPath();
+  for (let i = 0; i <= COLS; i++){
+    ctx.moveTo(mx + i*CELL*sc, my);
+    ctx.lineTo(mx + i*CELL*sc, my + mh);
+  }
+  for (let j = 0; j <= ROWS; j++){
+    ctx.moveTo(mx, my + j*CELL*sc);
+    ctx.lineTo(mx + mw, my + j*CELL*sc);
+  }
+  ctx.stroke();
+
+  for (const t of terminals){
+    ctx.fillStyle = phase === 'UPLOAD' ? TERM_COL : 'rgba(43,255,136,0.5)';
+    ctx.fillRect(mx + t.x*sc - 2, my + t.y*sc - 2, 4, 4);
+  }
+
+  for (const d of drops){
+    if (!d.known && phase !== 'UPDATE') continue;
+    let col;
+    if (d.resolved) col = d.updated ? 'rgba(43,255,136,0.45)' : 'rgba(255,59,48,0.45)';
+    else col = (d.id === primaryId && phase === 'LOCATE') ? PRIMARY_COL : DROP_COL;
+    ctx.fillStyle = col;
+    const s = (d.id === primaryId && phase === 'LOCATE' && !d.resolved) ? 4 : 3;
+    ctx.fillRect(mx + d.x*sc - s/2, my + d.y*sc - s/2, s, s);
+  }
+
+  for (const r of rivals){
+    if (r.state === 'patrol' && r.marked <= 0 && r.stunT <= 0) continue;
+    ctx.fillStyle = r.stunT > 0 ? '#3df0ff' : r.state === 'alert' ? '#ff3b30' : 'rgba(255,157,43,0.7)';
+    ctx.fillRect(mx + r.x*sc - 1.5, my + r.y*sc - 1.5, 3, 3);
+  }
+
+  ctx.fillStyle = PLAYER_COL;
+  ctx.beginPath();
+  ctx.arc(mx + player.x*sc, my + player.y*sc, 3.5, 0, TAU);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(61,240,255,0.25)';
+  ctx.strokeRect(mx + cam.x*sc, my + cam.y*sc, W*sc, H*sc);
+}
+
+/* ============================================================
+   SCREENS
+   ============================================================ */
+function drawTitle(){
+  ctx.fillStyle = '#04050a';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = 'rgba(61,240,255,0.06)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x < W; x += 44){ ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y < H; y += 44){ ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  const t = performance.now() / 1000;
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ff2d95';
+  ctx.font = 'bold 13px ui-monospace,monospace';
+  ctx.fillText('DDS // DEAD DROP SYSTEM', W/2, H/2 - 170);
+
+  ctx.fillStyle = '#3df0ff';
+  ctx.font = 'bold 62px ui-monospace,monospace';
+  ctx.fillText('DEAD DROP', W/2, H/2 - 100);
+
+  ctx.fillStyle = 'rgba(61,240,255,0.5)';
+  ctx.font = '16px ui-monospace,monospace';
+  ctx.fillText('C O U R I E R', W/2, H/2 - 68);
+
+  ctx.fillStyle = '#9fb6cc';
+  ctx.font = '13px ui-monospace,monospace';
+  const lines = [
+    'A near-future city. Encrypted caches rot in the walls.',
+    '',
+    'SCAN to find the freshest cache.  EXTRACT it.',
+    'UPLOAD at a secure terminal.  Then UPDATE every remaining drop',
+    'before the data decays — and before the patrols find you.',
+    '',
+    'Dead drops yield blueprints: weapons, transport, spiderphones, and Opium Lots.',
+    'Spend Opium Lots on the zigzagging subway: 10 lots per stop, 4 stations east-west.',
+    'Your loot, credits, and score persist across cycles — until you die.',
+    '',
+    'WASD move · SHIFT sprint · C crouch · E act · SPACE scan',
+    '1/2/3 weapon · LMB fire · Q/F/G spiderphone · H subway'
+  ];
+  lines.forEach((l, i) => ctx.fillText(l, W/2, H/2 + 10 + i * 22));
+
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(t * 3);
+  ctx.fillStyle = '#ffd23f';
+  ctx.font = 'bold 18px ui-monospace,monospace';
+  ctx.fillText('PRESS [SPACE] TO JACK IN', W/2, H/2 + 280);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+}
+
+function drawEndScreen(win){
+  ctx.fillStyle = 'rgba(4,5,10,0.86)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+
+  const t = performance.now() / 1000;
+
+  if (win){
+    ctx.fillStyle = '#2bff88';
+    ctx.font = 'bold 46px ui-monospace,monospace';
+    ctx.fillText('RUN COMPLETE', W/2, H/2 - 140);
+
+    ctx.fillStyle = '#9fb6cc';
+    ctx.font = '14px ui-monospace,monospace';
+    ctx.fillText('All dead drops secured. Progression preserved.', W/2, H/2 - 104);
+
+    ctx.font = '16px ui-monospace,monospace';
+    ctx.fillStyle = '#3df0ff';
+    ctx.fillText('CACHES SECURED   ' + stat.updated, W/2, H/2 - 56);
+    ctx.fillStyle = '#ff3b30';
+    ctx.fillText('CACHES LOST      ' + stat.lost, W/2, H/2 - 28);
+    ctx.fillStyle = '#ffd23f';
+    ctx.fillText('MISSION SCORE    ' + stat.score, W/2, H/2 + 4);
+
+    ctx.fillStyle = '#2bff88';
+    ctx.font = 'bold 22px ui-monospace,monospace';
+    ctx.fillText('TOTAL SCORE  ' + persistent.score, W/2, H/2 + 54);
+
+    ctx.fillStyle = SUBWAY_COL;
+    ctx.font = 'bold 16px ui-monospace,monospace';
+    ctx.fillText('◈ OPIUM LOTS  ' + persistent.credits, W/2, H/2 + 82);
+
+    let lx = W/2 - 260;
+    ctx.textAlign = 'left';
+    ctx.font = '12px ui-monospace,monospace';
+    ctx.fillStyle = 'rgba(159,182,204,0.7)';
+    ctx.fillText('LOOT BAG CARRIED FORWARD', lx, H/2 + 112);
+    let ly = H/2 + 132;
+    for (const k of WEAPON_ORDER){
+      const lvl = persistent.loot.weapons[k];
+      if (lvl > 0){
+        ctx.fillStyle = WEAPON_DEFS[k].col;
+        ctx.fillText('◆ ' + WEAPON_DEFS[k].name + '  L' + lvl, lx, ly);
+        ly += 16;
+      }
+    }
+    for (const k of ['runner', 'sprinter', 'ghost']){
+      const lvl = persistent.loot.transport[k];
+      if (lvl > 0){
+        ctx.fillStyle = TRANSPORT_DEFS[k].col;
+        ctx.fillText('◆ ' + TRANSPORT_DEFS[k].name + '  L' + lvl, lx, ly);
+        ly += 16;
+      }
+    }
+    for (const k of ['reset', 'spawn', 'remote']){
+      const n = persistent.loot.comms[k];
+      if (n > 0){
+        ctx.fillStyle = COMM_DEFS[k].col;
+        ctx.fillText('◆ ' + COMM_DEFS[k].name + '  ×' + n, lx, ly);
+        ly += 16;
+      }
+    }
+  } else {
+    ctx.fillStyle = '#ff3b30';
+    ctx.font = 'bold 46px ui-monospace,monospace';
+    ctx.fillText('COURIER DOWN', W/2, H/2 - 120);
+
+    ctx.fillStyle = '#9fb6cc';
+    ctx.font = '14px ui-monospace,monospace';
+    ctx.fillText('Signal lost. All accumulated data and loot wiped.', W/2, H/2 - 84);
+
+    ctx.font = '16px ui-monospace,monospace';
+    ctx.fillStyle = '#3df0ff';
+    ctx.fillText('CACHES SECURED   ' + stat.updated, W/2, H/2 - 36);
+    ctx.fillStyle = '#ff3b30';
+    ctx.fillText('CACHES LOST      ' + stat.lost, W/2, H/2 - 8);
+    ctx.fillStyle = '#ffd23f';
+    ctx.fillText('MISSION SCORE    ' + stat.score, W/2, H/2 + 20);
+
+    ctx.fillStyle = '#ff3b30';
+    ctx.font = 'bold 20px ui-monospace,monospace';
+    ctx.fillText('TOTAL SCORE LOST  ' + persistent.score, W/2, H/2 + 66);
+    ctx.fillStyle = SUBWAY_COL;
+    ctx.font = 'bold 16px ui-monospace,monospace';
+    ctx.fillText('OPIUM LOTS LOST   ' + persistent.credits, W/2, H/2 + 92);
+    ctx.fillStyle = 'rgba(159,182,204,0.5)';
+    ctx.font = '12px ui-monospace,monospace';
+    ctx.fillText('Cycle counter reset to 1. Loot bag cleared.', W/2, H/2 + 118);
+  }
+
+  ctx.textAlign = 'center';
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(t * 3);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px ui-monospace,monospace';
+  ctx.fillText(win ? 'PRESS [R] FOR NEXT CYCLE' : 'PRESS [R] TO RESTART FROM SCRATCH', W/2, H/2 + 160);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+}
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+genWorld();
+buildSubway();
+cycleNum = 0;
+gameState = 'TITLE';
+initPersistent();
+player = { x: WW/2, y: WH/2, r: 11, hp: 100, maxHp: 100, angle: 0, crouch:false, sprint:false, hurtT:0, activeWeapon:null, weaponCd:{smg:0,taser:0,emp:0} };
+cam = { x: player.x - W/2, y: player.y - H/2 };
+drops = []; terminals = []; rivals = []; pulses = []; particles = []; effects = []; bullets = []; messages = [];
+phase = 'LOCATE'; heat = 0; scanCd = 0; primaryId = null;
+action = { active:false, type:null, target:null, progress:0, duration:0 };
+stat = { updated: 0, lost: 0, score: 0 };
+spawnTimer = 0; shakeT = 0; shakeMag = 0; endTimer = 0;
+
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (gameState === 'PLAY') update(dt);
+  else {
+    for (let i = messages.length - 1; i >= 0; i--){
+      messages[i].t += dt;
+      if (messages[i].t > messages[i].dur) messages.splice(i, 1);
+    }
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
